@@ -14,25 +14,12 @@ import pandas as pd
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
-# ⏰ 1 volta al giorno (test: metti 60)
 CHECK_INTERVAL_SECONDS = 86400
 
 ASSETS = [
-    # 📊 AZIONI BIG
-    "AAPL", "TSLA", "NVDA",
-
-    # 📈 ETF
-    "SPY", "QQQ",
-
-    # 🪙 CRYPTO
-    "BTC-USD", "ETH-USD", "SOL-USD",
-
-    # 🛢️ MATERIE PRIME
-    "GC=F",   # oro
-    "CL=F",   # petrolio
-
-    # 🚀 SPECULATIVE
-    "PLTR", "COIN", "RIOT"
+"AAPL", "MSFT", "NVDA", "AMZN", "META",
+"GOOGL", "TSLA", "JPM", "V", "UNH",
+"BTC-USD", "ETH-USD", "SOL-USD"
 ]
 
 # =========================
@@ -40,141 +27,171 @@ ASSETS = [
 # =========================
 
 def send(msg: str):
-    if not TELEGRAM_TOKEN or not CHAT_ID:
-        print("❌ Token o Chat ID mancanti")
-        return
+if not TELEGRAM_TOKEN or not CHAT_ID:
+print("Token mancanti")
+return
 
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
 
-    try:
-        response = requests.post(
-            url,
-            data={"chat_id": CHAT_ID, "text": msg},
-            timeout=20
-        )
-        print("Telegram:", response.status_code)
-    except Exception as e:
-        print("Errore Telegram:", e)
+try:
+requests.post(url, data={"chat_id": CHAT_ID, "text": msg}, timeout=20)
+except Exception as e:
+print("Telegram error:", e)
 
 # =========================
-# ANALISI
+# DATA
 # =========================
 
-def analyze(ticker: str):
-    data = yf.download(
-        ticker,
-        period="6mo",
-        interval="1d",
-        progress=False,
-        auto_adjust=True
-    )
+def get_data(ticker):
+data = yf.download(ticker, period="6mo", interval="1d", progress=False)
 
-    if data is None or data.empty:
-        return None
+if data is None or data.empty:
+return None
 
-    close = data["Close"]
+close = data["Close"]
 
-    # 🔥 FIX CRITICO (yfinance bug)
-    if isinstance(close, pd.DataFrame):
-        close = close.iloc[:, 0]
+if isinstance(close, pd.DataFrame):
+close = close.iloc[:, 0]
 
-    close = close.dropna()
+close = close.dropna()
 
-    if len(close) < 60:
-        return None
+if len(close) < 60:
+return None
 
-    rsi_series = ta.momentum.RSIIndicator(close).rsi()
-    rsi = float(rsi_series.iloc[-1])
-
-    ma50 = float(close.rolling(50).mean().iloc[-1])
-    price = float(close.iloc[-1])
-
-    score = 0
-
-    # 📊 scoring migliorato
-    if rsi < 35:
-        score += (50 - rsi) * 1.5
-
-    if price > ma50:
-        score += 30
-
-    # 🎯 decisione
-    if score >= 60:
-        signal = "BUY"
-    else:
-        signal = "HOLD"
-
-    return {
-        "ticker": ticker,
-        "price": round(price, 2),
-        "rsi": round(rsi, 2),
-        "score": round(score, 2),
-        "signal": signal
-    }
+return close
 
 # =========================
-# SCAN GIORNALIERO
+# ANALISI + ENTRY/EXIT
+# =========================
+
+def analyze(ticker, close):
+price = float(close.iloc[-1])
+
+rsi = float(ta.momentum.RSIIndicator(close).rsi().iloc[-1])
+
+ma20 = float(close.rolling(20).mean().iloc[-1])
+ma50 = float(close.rolling(50).mean().iloc[-1])
+
+score = 0
+reasons = []
+
+# TREND
+if price > ma50:
+score += 30
+reasons.append("trend rialzista")
+
+# MOMENTUM
+if ma20 > ma50:
+score += 20
+reasons.append("momentum positivo")
+
+# PULLBACK
+if 30 < rsi < 45:
+score += 30
+reasons.append("pullback sano")
+
+# OVERHEAT
+if rsi > 70:
+score -= 25
+reasons.append("ipercomprato")
+
+if score < 60:
+return None
+
+# =========================
+# ENTRY / EXIT LOGIC
+# =========================
+
+entry = price
+
+stop_loss = ma50 * 0.98 # sotto trend
+take_profit_1 = entry * 1.06
+take_profit_2 = entry * 1.12
+
+risk = entry - stop_loss
+reward = take_profit_2 - entry
+
+rr_ratio = round(reward / risk, 2) if risk > 0 else 0
+
+probability = min(85, max(45, score + 15))
+
+return {
+"ticker": ticker,
+"price": round(price, 2),
+"rsi": round(rsi, 2),
+"score": round(score, 2),
+"probability": round(probability, 1),
+"entry": round(entry, 2),
+"sl": round(stop_loss, 2),
+"tp1": round(take_profit_1, 2),
+"tp2": round(take_profit_2, 2),
+"rr": rr_ratio,
+"reasons": reasons
+}
+
+# =========================
+# SCANNER
 # =========================
 
 def run_once():
-    print(f"\n=== SCAN {datetime.now()} ===")
+print(f"\n=== SCAN {datetime.now()} ===")
 
-    results = []
+candidates = []
 
-    for asset in ASSETS:
-        try:
-            result = analyze(asset)
+for asset in ASSETS:
+try:
+close = get_data(asset)
+if close is None:
+continue
 
-            if result:
-                print(asset, result)
+result = analyze(asset, close)
 
-                if result["signal"] == "BUY":
-                    results.append(result)
+if result:
+candidates.append(result)
 
-        except Exception as e:
-            print(f"Errore su {asset}: {e}")
+except Exception as e:
+print(f"Errore {asset}: {e}")
 
-    if not results:
-        send("⚠️ Nessuna opportunità forte oggi")
-        return
+if not candidates:
+send("⚠️ Nessuna opportunità con rischio/rendimento valido")
+return
 
-    # 🔥 ordina per punteggio
-    results.sort(key=lambda x: x["score"], reverse=True)
+# ranking per probabilità + qualità rischio
+candidates.sort(key=lambda x: (x["probability"], x["rr"]), reverse=True)
 
-    top = results[:3]
+top = candidates[:3]
 
-    # 📲 messaggio finale
-    message = "🔥 TOP 3 OPPORTUNITÀ OGGI\n\n"
+msg = "🔥 TOP 3 TRADE SETUP\n\n"
 
-    for i, r in enumerate(top, 1):
-        message += (
-            f"{i}) {r['ticker']} → BUY\n"
-            f"Prezzo: {r['price']}\n"
-            f"RSI: {r['rsi']}\n"
-            f"Score: {r['score']}\n\n"
-        )
+for i, r in enumerate(top, 1):
+msg += (
+f"{i}) {r['ticker']}\n"
+f"Entry: {r['entry']}\n"
+f"SL: {r['sl']}\n"
+f"TP1: {r['tp1']} | TP2: {r['tp2']}\n"
+f"RR: {r['rr']}\n"
+f"Prob: {r['probability']}%\n"
+f"{', '.join(r['reasons'])}\n\n"
+)
 
-    message += "⚠️ Solo segnali ad alta probabilità"
-
-    send(message)
+send(msg)
 
 # =========================
 # MAIN
 # =========================
 
 def main():
-    print("🔥 BOT AVVIATO")
+print("🔥 SYSTEM READY")
 
-    send("✅ Bot attivo - modalità TOP 3 giornaliero")
+send("✅ Bot attivo - ENTRY/EXIT + RISK MANAGEMENT")
 
-    while True:
-        try:
-            run_once()
-        except Exception as e:
-            print("Errore ciclo:", e)
+while True:
+try:
+run_once()
+except Exception as e:
+print("Errore ciclo:", e)
 
-        print(f"Attendo {CHECK_INTERVAL_SECONDS} secondi...")
-        time.sleep(CHECK_INTERVAL_SECONDS)
+time.sleep(CHECK_INTERVAL_SECONDS)
 
 if __name__ == "__main__":
-    main()
+main()
