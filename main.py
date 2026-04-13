@@ -1,4 +1,4 @@
-send ("TEST TELEGRAM DA MAIN") 
+send ("TEST TELEGRAM DA MAIN")
 import os
 import json
 import time
