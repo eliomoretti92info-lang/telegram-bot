@@ -1,4 +1,4 @@
-def main ()
+main ()
 print("TEST AVVIO BOT")
 send ("TELEGRAM COLLLEGGATO CORRETTAMENTE")
 run_once()
