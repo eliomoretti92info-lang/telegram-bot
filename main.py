@@ -16,9 +16,11 @@ CHAT_ID = os.getenv("CHAT_ID")
 
 CHECK_INTERVAL_SECONDS = 86400
 
+CAPITAL = 10000
+RISK_PER_TRADE = 0.02  # 2%
+
 ASSETS = [
-    "AAPL", "MSFT", "NVDA", "AMZN", "META",
-    "GOOGL", "TSLA", "JPM", "V", "UNH",
+    "AAPL", "MSFT", "NVDA", "AMZN", "TSLA",
     "BTC-USD", "ETH-USD", "SOL-USD"
 ]
 
@@ -61,7 +63,7 @@ def get_data(ticker):
     return close
 
 # =========================
-# ANALISI + ENTRY/EXIT
+# ANALISI + RISK MANAGEMENT
 # =========================
 
 def analyze(ticker, close):
@@ -75,68 +77,61 @@ def analyze(ticker, close):
     score = 0
     reasons = []
 
-    # TREND
     if price > ma50:
         score += 30
-        reasons.append("trend rialzista")
+        reasons.append("trend")
 
-    # MOMENTUM
     if ma20 > ma50:
         score += 20
-        reasons.append("momentum positivo")
+        reasons.append("momentum")
 
-    # PULLBACK
     if 30 < rsi < 45:
         score += 30
-        reasons.append("pullback sano")
-
-    # OVERHEAT
-    if rsi > 70:
-        score -= 25
-        reasons.append("ipercomprato")
+        reasons.append("pullback")
 
     if score < 60:
         return None
 
-    # =========================
-    # ENTRY / EXIT LOGIC
-    # =========================
-
+    # ENTRY / EXIT
     entry = price
+    stop_loss = ma50 * 0.98
+    tp1 = entry * 1.06
+    tp2 = entry * 1.12
 
-    stop_loss = ma50 * 0.98   # sotto trend
-    take_profit_1 = entry * 1.06
-    take_profit_2 = entry * 1.12
+    risk_per_unit = entry - stop_loss
 
-    risk = entry - stop_loss
-    reward = take_profit_2 - entry
+    if risk_per_unit <= 0:
+        return None
 
-    rr_ratio = round(reward / risk, 2) if risk > 0 else 0
+    # 💰 POSITION SIZE
+    capital_risk = CAPITAL * RISK_PER_TRADE
+    size = capital_risk / risk_per_unit
 
-    probability = min(85, max(45, score + 15))
+    investment = size * entry
+
+    probability = min(85, score + 15)
 
     return {
         "ticker": ticker,
-        "price": round(price, 2),
-        "rsi": round(rsi, 2),
-        "score": round(score, 2),
-        "probability": round(probability, 1),
         "entry": round(entry, 2),
         "sl": round(stop_loss, 2),
-        "tp1": round(take_profit_1, 2),
-        "tp2": round(take_profit_2, 2),
-        "rr": rr_ratio,
+        "tp1": round(tp1, 2),
+        "tp2": round(tp2, 2),
+        "size": int(size),
+        "investment": round(investment, 2),
+        "risk": round(capital_risk, 2),
+        "prob": round(probability, 1),
         "reasons": reasons
     }
 
 # =========================
-# SCANNER
+# SCAN
 # =========================
 
 def run_once():
     print(f"\n=== SCAN {datetime.now()} ===")
 
-    candidates = []
+    setups = []
 
     for asset in ASSETS:
         try:
@@ -147,31 +142,31 @@ def run_once():
             result = analyze(asset, close)
 
             if result:
-                candidates.append(result)
+                setups.append(result)
 
         except Exception as e:
-            print(f"Errore {asset}: {e}")
+            print("Errore:", e)
 
-    if not candidates:
-        send("⚠️ Nessuna opportunità con rischio/rendimento valido")
+    if not setups:
+        send("⚠️ Nessun trade valido oggi")
         return
 
-    # ranking per probabilità + qualità rischio
-    candidates.sort(key=lambda x: (x["probability"], x["rr"]), reverse=True)
+    setups.sort(key=lambda x: x["prob"], reverse=True)
 
-    top = candidates[:3]
+    top = setups[:3]
 
-    msg = "🔥 TOP 3 TRADE SETUP\n\n"
+    msg = "💰 TRADE PLAN (10.000€)\n\n"
 
-    for i, r in enumerate(top, 1):
+    for i, t in enumerate(top, 1):
         msg += (
-            f"{i}) {r['ticker']}\n"
-            f"Entry: {r['entry']}\n"
-            f"SL: {r['sl']}\n"
-            f"TP1: {r['tp1']} | TP2: {r['tp2']}\n"
-            f"RR: {r['rr']}\n"
-            f"Prob: {r['probability']}%\n"
-            f"{', '.join(r['reasons'])}\n\n"
+            f"{i}) {t['ticker']}\n"
+            f"Entry: {t['entry']}\n"
+            f"SL: {t['sl']}\n"
+            f"TP1: {t['tp1']} | TP2: {t['tp2']}\n"
+            f"Size: {t['size']} unità\n"
+            f"Investimento: {t['investment']}€\n"
+            f"Rischio: {t['risk']}€\n"
+            f"Prob: {t['prob']}%\n\n"
         )
 
     send(msg)
@@ -181,16 +176,10 @@ def run_once():
 # =========================
 
 def main():
-    print("🔥 SYSTEM READY")
-
-    send("✅ Bot attivo - ENTRY/EXIT + RISK MANAGEMENT")
+    send("✅ Bot attivo - gestione capitale")
 
     while True:
-        try:
-            run_once()
-        except Exception as e:
-            print("Errore ciclo:", e)
-
+        run_once()
         time.sleep(CHECK_INTERVAL_SECONDS)
 
 if __name__ == "__main__":
