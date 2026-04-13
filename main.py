@@ -1,4 +1,5 @@
-main ():
-print("TEST AVVIO BOT")
-send ("TELEGRAM COLLLEGGATO CORRETTAMENTE")
-run_once()
+def main():
+    print("🔥 TEST AVVIO BOT")
+    send("🧪 TEST: Telegram collegato correttamente")
+
+    run_once()
