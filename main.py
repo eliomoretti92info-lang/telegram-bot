@@ -1,11 +1,9 @@
 import os
 import time
-from datetime import datetime
-
 import requests
 import yfinance as yf
-import ta
 import pandas as pd
+import ta
 
 # =========================
 # CONFIG
@@ -14,37 +12,31 @@ import pandas as pd
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
-CHECK_INTERVAL_SECONDS = 86400
-
-CAPITAL = 10000
-RISK_PER_TRADE = 0.02  # 2%
+CHECK_INTERVAL = 86400  # 1 volta al giorno
 
 ASSETS = [
-    "AAPL", "MSFT", "NVDA", "AMZN", "TSLA",
-    "BTC-USD", "ETH-USD", "SOL-USD"
+    "AAPL", "MSFT", "NVDA", "AMZN", "META",
+    "TSLA", "GOOGL", "AMD",
+    "BTC-USD", "ETH-USD", "SOL-USD",
+    "SPY", "QQQ"
 ]
 
 # =========================
 # TELEGRAM
 # =========================
 
-def send(msg: str):
-    if not TELEGRAM_TOKEN or not CHAT_ID:
-        print("Token mancanti")
-        return
-
+def send(msg):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-
     try:
-        requests.post(url, data={"chat_id": CHAT_ID, "text": msg}, timeout=20)
+        requests.post(url, data={"chat_id": CHAT_ID, "text": msg})
     except Exception as e:
         print("Telegram error:", e)
 
 # =========================
-# DATA
+# PRICE
 # =========================
 
-def get_data(ticker):
+def get_price(ticker):
     data = yf.download(ticker, period="6mo", interval="1d", progress=False)
 
     if data is None or data.empty:
@@ -55,119 +47,105 @@ def get_data(ticker):
     if isinstance(close, pd.DataFrame):
         close = close.iloc[:, 0]
 
-    close = close.dropna()
+    return float(close.dropna().iloc[-1])
+
+# =========================
+# ANALYSIS
+# =========================
+
+def analyze(ticker):
+    data = yf.download(ticker, period="6mo", interval="1d", progress=False)
+
+    if data is None or data.empty:
+        return None
+
+    close = data["Close"].dropna()
 
     if len(close) < 60:
         return None
 
-    return close
-
-# =========================
-# ANALISI + RISK MANAGEMENT
-# =========================
-
-def analyze(ticker, close):
     price = float(close.iloc[-1])
 
-    rsi = float(ta.momentum.RSIIndicator(close).rsi().iloc[-1])
-
-    ma20 = float(close.rolling(20).mean().iloc[-1])
-    ma50 = float(close.rolling(50).mean().iloc[-1])
+    rsi = ta.momentum.RSIIndicator(close).rsi().iloc[-1]
+    ma20 = close.rolling(20).mean().iloc[-1]
+    ma50 = close.rolling(50).mean().iloc[-1]
 
     score = 0
     reasons = []
 
     if price > ma50:
         score += 30
-        reasons.append("trend")
+        reasons.append("trend positivo")
 
     if ma20 > ma50:
         score += 20
-        reasons.append("momentum")
+        reasons.append("momentum positivo")
 
     if 30 < rsi < 45:
         score += 30
-        reasons.append("pullback")
+        reasons.append("pullback sano")
 
-    if score < 60:
+    if rsi > 70:
+        score -= 20
+        reasons.append("ipercomprato")
+
+    if score < 50:
         return None
 
-    # ENTRY / EXIT
-    entry = price
-    stop_loss = ma50 * 0.98
-    tp1 = entry * 1.06
-    tp2 = entry * 1.12
-
-    risk_per_unit = entry - stop_loss
-
-    if risk_per_unit <= 0:
-        return None
-
-    # 💰 POSITION SIZE
-    capital_risk = CAPITAL * RISK_PER_TRADE
-    size = capital_risk / risk_per_unit
-
-    investment = size * entry
-
-    probability = min(85, score + 15)
+    sl = price * 0.96
+    tp1 = price * 1.05
+    tp2 = price * 1.10
 
     return {
         "ticker": ticker,
-        "entry": round(entry, 2),
-        "sl": round(stop_loss, 2),
+        "price": round(price, 2),
+        "score": round(score, 2),
+        "rsi": round(rsi, 2),
+        "sl": round(sl, 2),
         "tp1": round(tp1, 2),
         "tp2": round(tp2, 2),
-        "size": int(size),
-        "investment": round(investment, 2),
-        "risk": round(capital_risk, 2),
-        "prob": round(probability, 1),
         "reasons": reasons
     }
 
 # =========================
-# SCAN
+# TOP 3 SCANNER
 # =========================
 
-def run_once():
-    print(f"\n=== SCAN {datetime.now()} ===")
-
-    setups = []
+def run():
+    candidates = []
 
     for asset in ASSETS:
         try:
-            close = get_data(asset)
-            if close is None:
-                continue
-
-            result = analyze(asset, close)
-
+            result = analyze(asset)
             if result:
-                setups.append(result)
-
+                candidates.append(result)
         except Exception as e:
-            print("Errore:", e)
+            print(f"Errore {asset}: {e}")
 
-    if not setups:
-        send("⚠️ Nessun trade valido oggi")
+    if not candidates:
+        send("⚠️ Nessuna opportunità interessante oggi")
         return
 
-    setups.sort(key=lambda x: x["prob"], reverse=True)
+    candidates.sort(key=lambda x: x["score"], reverse=True)
 
-    top = setups[:3]
+    top = candidates[:3]
 
-    msg = "💰 TRADE PLAN (10.000€)\n\n"
+    msg = "🔥 TOP 3 OPPORTUNITÀ DEL GIORNO\n\n"
 
     for i, t in enumerate(top, 1):
-        msg += (
-            f"{i}) {t['ticker']}\n"
-            f"Entry: {t['entry']}\n"
-            f"SL: {t['sl']}\n"
-            f"TP1: {t['tp1']} | TP2: {t['tp2']}\n"
-            f"Size: {t['size']} unità\n"
-            f"Investimento: {t['investment']}€\n"
-            f"Rischio: {t['risk']}€\n"
-            f"Prob: {t['prob']}%\n\n"
-        )
+        msg += f"""
+{i}) {t['ticker']}
+📌 Prezzo: {t['price']}
+
+🛑 Stop Loss: {round(t['sl'],2)}
+🎯 TP1: {round(t['tp1'],2)}
+🎯 TP2: {round(t['tp2'],2)}
+
+📊 Score: {t['score']}
+💡 Motivi: {', '.join(t['reasons'])}
+
+-----------------------
+"""
 
     send(msg)
 
@@ -176,11 +154,15 @@ def run_once():
 # =========================
 
 def main():
-    send("✅ Bot attivo - gestione capitale")
+    send("✅ Bot attivo - TOP 3 intelligente")
 
     while True:
-        run_once()
-        time.sleep(CHECK_INTERVAL_SECONDS)
+        try:
+            run()
+        except Exception as e:
+            print("Errore generale:", e)
+
+        time.sleep(CHECK_INTERVAL)
 
 if __name__ == "__main__":
     main()
