@@ -1,3 +1,4 @@
+send ("TEST TELEGRAM DA MAIN")
 import os
 import json
 import time
