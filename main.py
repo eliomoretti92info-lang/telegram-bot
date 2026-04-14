@@ -13,15 +13,14 @@ import ta
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
-CHECK_INTERVAL = 600  # 10 minuti
-
+CHECK_INTERVAL = 30  # velocissimo
 POSITIONS_FILE = "positions.json"
 
 ASSETS = [
-    "AAPL", "MSFT", "NVDA", "AMZN", "META",
-    "TSLA", "GOOGL", "AMD",
-    "BTC-USD", "ETH-USD", "SOL-USD",
-    "SPY", "QQQ"
+    "AAPL","MSFT","NVDA","AMZN","META",
+    "TSLA","GOOGL","AMD","PLTR",
+    "BTC-USD","ETH-USD","SOL-USD",
+    "SPY","QQQ"
 ]
 
 # =========================
@@ -37,11 +36,13 @@ def send(msg):
 
 def get_updates(offset=None):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
-    params = {"timeout": 10, "offset": offset}
-    return requests.get(url, params=params).json()
+    try:
+        return requests.get(url, params={"offset": offset, "timeout": 10}).json()
+    except:
+        return {}
 
 # =========================
-# MEMORY
+# STORAGE
 # =========================
 
 def load_positions():
@@ -59,51 +60,50 @@ def save_positions(data):
 # =========================
 
 def get_price(ticker):
-    data = yf.download(ticker, period="6mo", interval="1d", progress=False)
+    data = yf.download(ticker, period="5d", interval="1h", progress=False)
 
     if data is None or data.empty:
         return None
 
     close = data["Close"]
-
     if isinstance(close, pd.DataFrame):
         close = close.iloc[:, 0]
 
     return float(close.dropna().iloc[-1])
 
 # =========================
-# SIGNAL GENERATOR
+# ANALISI
 # =========================
 
-def generate_signal(ticker):
-    price = get_price(ticker)
-
-    data = yf.download(ticker, period="6mo", interval="1d", progress=False)
-    close = data["Close"].dropna()
-
-    if len(close) < 60:
+def analyze(ticker):
+    data = yf.download(ticker, period="3mo", interval="1d", progress=False)
+    if data is None or data.empty:
         return None
+
+    close = data["Close"]
+    if isinstance(close, pd.DataFrame):
+        close = close.iloc[:, 0]
+
+    close = close.dropna()
+    if len(close) < 50:
+        return None
+
+    price = float(close.iloc[-1])
 
     rsi = ta.momentum.RSIIndicator(close).rsi().iloc[-1]
     ma20 = close.rolling(20).mean().iloc[-1]
     ma50 = close.rolling(50).mean().iloc[-1]
 
     score = 0
-    reasons = []
 
     if price > ma50:
         score += 30
-        reasons.append("trend positivo")
-
     if ma20 > ma50:
         score += 20
-        reasons.append("momentum")
-
     if 30 < rsi < 45:
         score += 30
-        reasons.append("pullback")
 
-    if score < 50:
+    if score < 40:
         return None
 
     return {
@@ -111,141 +111,192 @@ def generate_signal(ticker):
         "price": price,
         "score": score,
         "sl": price * 0.96,
-        "tp1": price * 1.05,
-        "tp2": price * 1.10,
-        "reasons": reasons
+        "tp1": price * 1.05
     }
 
 # =========================
-# TOP 3 DAILY
+# SPECULATIVO (MOVIMENTI FORTI)
 # =========================
 
-def run_daily():
+def scan_speculative():
+    alerts = []
+
+    for t in ASSETS:
+        try:
+            data = yf.download(t, period="2d", interval="1h", progress=False)
+            close = data["Close"].dropna()
+
+            change = (close.iloc[-1] - close.iloc[-5]) / close.iloc[-5] * 100
+
+            if abs(change) > 3:
+                alerts.append((t, round(change,2)))
+        except:
+            continue
+
+    if alerts:
+        msg = "⚡ MOVIMENTI FORTI:\n\n"
+        for t, c in alerts:
+            direction = "📈" if c > 0 else "📉"
+            msg += f"{t} {direction} {c}%\n"
+        send(msg)
+
+# =========================
+# TOP
+# =========================
+
+def run_top():
     candidates = []
 
-    for asset in ASSETS:
+    for t in ASSETS:
         try:
-            res = generate_signal(asset)
+            res = analyze(t)
             if res:
                 candidates.append(res)
         except:
             continue
 
     if not candidates:
-        send("⚠️ Nessuna opportunità oggi")
+        send("⚠️ Mercato debole")
         return
 
     candidates.sort(key=lambda x: x["score"], reverse=True)
     top = candidates[:3]
 
-    msg = "🔥 TOP 3 OPPORTUNITÀ\n\n"
+    msg = "🔥 MIGLIORI ORA:\n\n"
 
     for t in top:
         msg += f"""
-💰 {t['ticker']}
-📌 Prezzo: {round(t['price'],2)}
+{t['ticker']}
+Prezzo: {round(t['price'],2)}
+SL: {round(t['sl'],2)}
+TP: {round(t['tp1'],2)}
 
-🛑 SL: {round(t['sl'],2)}
-🎯 TP1: {round(t['tp1'],2)}
-🎯 TP2: {round(t['tp2'],2)}
+Scrivi:
+BUY {t['ticker']}
+BUY {t['ticker']} prezzo
 
-👉 Scrivi:
-BUY {t['ticker']} oppure SKIP {t['ticker']}
-
--------------------
+---------
 """
 
     send(msg)
 
 # =========================
-# COMMAND HANDLER
-# =========================
-
-def handle_commands(offset):
-    updates = get_updates(offset)
-    positions = load_positions()
-
-    for u in updates.get("result", []):
-        offset = u["update_id"] + 1
-
-        try:
-            text = u["message"]["text"].upper()
-        except:
-            continue
-
-        parts = text.split()
-
-        if len(parts) != 2:
-            continue
-
-        cmd, ticker = parts
-
-        price = get_price(ticker)
-
-        if cmd == "BUY":
-            positions[ticker] = {
-                "entry": price,
-                "sl": price * 0.96,
-                "tp1": price * 1.05,
-                "tp2": price * 1.10,
-                "tp1_hit": False
-            }
-
-            send(f"✅ BUY registrato su {ticker} a {round(price,2)}")
-
-        elif cmd == "SKIP":
-            send(f"⏭️ {ticker} ignorato")
-
-    save_positions(positions)
-    return offset
-
-# =========================
-# MONITOR POSITIONS
+# MONITOR
 # =========================
 
 def monitor():
     positions = load_positions()
 
-    for ticker in list(positions.keys()):
-        price = get_price(ticker)
-        pos = positions[ticker]
+    for t in list(positions.keys()):
+        price = get_price(t)
+        pos = positions[t]
 
-        if price >= pos["tp1"] and not pos["tp1_hit"]:
-            send(f"🔔 {ticker} +5% → valuta vendita parziale")
+        pnl = (price - pos["entry"]) / pos["entry"] * 100
+
+        if pnl >= 5 and not pos.get("tp1_hit"):
+            send(f"💰 {t} +5% → valuta vendita")
             pos["tp1_hit"] = True
 
-        elif price >= pos["tp2"]:
-            send(f"🚀 {ticker} target raggiunto → chiudi posizione")
-            del positions[ticker]
+        if pnl <= -4:
+            send(f"⚠️ {t} -4% → stop loss")
+            del positions[t]
             continue
 
-        elif price <= pos["sl"]:
-            send(f"⚠️ {ticker} stop loss → esci")
-            del positions[ticker]
-            continue
-
-        positions[ticker] = pos
+        positions[t] = pos
 
     save_positions(positions)
 
 # =========================
-# MAIN LOOP
+# COMMANDS
+# =========================
+
+def handle_commands(offset):
+    data = get_updates(offset)
+    positions = load_positions()
+
+    for u in data.get("result", []):
+        offset = u["update_id"] + 1
+
+        msg = u.get("message", {})
+        text = msg.get("text", "").upper().strip()
+
+        print("📩", text)
+
+        parts = text.split()
+
+        if text == "TOP":
+            run_top()
+
+        elif text == "STATUS":
+            if not positions:
+                send("📭 Nessuna posizione")
+            else:
+                msg = "💼 PORTAFOGLIO:\n\n"
+                for t in positions:
+                    price = get_price(t)
+                    entry = positions[t]["entry"]
+                    pnl = (price - entry) / entry * 100
+                    msg += f"{t}: {round(pnl,2)}%\n"
+                send(msg)
+
+        elif text == "AIUTO":
+            send("BUY TICKER o BUY TICKER PREZZO\nTOP\nSTATUS")
+
+        elif len(parts) >= 2:
+
+            cmd = parts[0]
+            ticker = parts[1]
+
+            price = get_price(ticker)
+
+            if not price:
+                send("❌ Ticker non valido")
+                continue
+
+            # BUY manuale prezzo
+            if cmd == "BUY":
+
+                if len(parts) == 3:
+                    try:
+                        entry_price = float(parts[2])
+                    except:
+                        entry_price = price
+                else:
+                    entry_price = price
+
+                positions[ticker] = {
+                    "entry": entry_price,
+                    "tp1_hit": False
+                }
+
+                send(f"✅ {ticker} registrato a {round(entry_price,2)}")
+
+        save_positions(positions)
+
+    return offset
+
+# =========================
+# MAIN
 # =========================
 
 def main():
-    send("✅ Bot interattivo attivo")
+    send("🚀 Bot PRO attivo")
 
     offset = None
-    last_daily = 0
+    last_top = 0
+    last_spec = 0
 
     while True:
         try:
             offset = handle_commands(offset)
 
-            # TOP 3 1 volta al giorno
-            if time.time() - last_daily > 86400:
-                run_daily()
-                last_daily = time.time()
+            if time.time() - last_top > 3600:
+                run_top()
+                last_top = time.time()
+
+            if time.time() - last_spec > 900:
+                scan_speculative()
+                last_spec = time.time()
 
             monitor()
 
