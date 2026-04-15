@@ -56,51 +56,65 @@ def save_positions(data):
 # =========================
 
 def get_price(ticker):
-    data = yf.download(ticker, period="5d", interval="1h", progress=False)
-    if data is None or data.empty:
+    try:
+        data = yf.download(ticker, period="5d", interval="1h", progress=False)
+        if data is None or data.empty:
+            return None
+
+        close = data["Close"]
+        if isinstance(close, pd.DataFrame):
+            close = close.iloc[:, 0]
+
+        return float(close.dropna().iloc[-1])
+    except:
         return None
-
-    close = data["Close"]
-    if isinstance(close, pd.DataFrame):
-        close = close.iloc[:, 0]
-
-    return float(close.dropna().iloc[-1])
 
 # =========================
 # ANALISI BASE
 # =========================
 
 def analyze(ticker):
-    data = yf.download(ticker, period="3mo", interval="1d", progress=False)
-    if data is None or data.empty:
+    try:
+        data = yf.download(ticker, period="3mo", interval="1d", progress=False)
+        if data is None or data.empty:
+            return None
+
+        close = data["Close"]
+        if isinstance(close, pd.DataFrame):
+            close = close.iloc[:, 0]
+
+        close = close.dropna()
+        if len(close) < 50:
+            return None
+
+        price = float(close.iloc[-1])
+        rsi = ta.momentum.RSIIndicator(close).rsi().iloc[-1]
+        ma50 = close.rolling(50).mean().iloc[-1]
+
+        trend = "rialzista" if price > ma50 else "debole"
+
+        # 👉 LOGICA CONSIGLIO
+        if rsi < 40 and trend == "rialzista":
+            advice = "entra ora"
+        elif rsi > 65 or trend == "debole":
+            advice = "situazione rischiosa"
+        else:
+            advice = "meglio aspettare"
+
+        return {
+            "ticker": ticker,
+            "price": price,
+            "rsi": rsi,
+            "trend": trend,
+            "sl": price * 0.96,
+            "tp": price * 1.05,
+            "advice": advice
+        }
+    except:
         return None
-
-    close = data["Close"]
-    if isinstance(close, pd.DataFrame):
-        close = close.iloc[:, 0]
-
-    close = close.dropna()
-    if len(close) < 50:
-        return None
-
-    price = float(close.iloc[-1])
-    rsi = ta.momentum.RSIIndicator(close).rsi().iloc[-1]
-    ma20 = close.rolling(20).mean().iloc[-1]
-    ma50 = close.rolling(50).mean().iloc[-1]
-
-    trend = "rialzista" if price > ma50 else "debole"
-
-    return {
-        "ticker": ticker,
-        "price": price,
-        "rsi": rsi,
-        "trend": trend,
-        "sl": price * 0.96,
-        "tp": price * 1.05
-    }
 
 # =========================
-# ANALYZE TICKER (NUOVO)
+# ANALYZE TICKER
 # =========================
 
 def analyze_ticker_command(ticker):
@@ -110,26 +124,15 @@ def analyze_ticker_command(ticker):
         send(f"❌ Impossibile analizzare {ticker}")
         return
 
-    rsi = res["rsi"]
-
-    if rsi < 40:
-        status = "interessante"
-    elif rsi > 65:
-        status = "attenzione (alto)"
-    else:
-        status = "neutrale"
-
     msg = f"""
 📊 ANALISI {ticker}
 
 Prezzo: {round(res['price'],2)}
 
 👉 Trend: {res['trend']}
-👉 RSI: {round(rsi,1)} ({status})
+👉 RSI: {round(res['rsi'],1)}
 
-💡 Cosa fare:
-✔ possibile valutazione ingresso
-⚠️ evita se incerto
+👉 Consiglio: {res['advice']}
 
 SL: {round(res['sl'],2)}
 TP: {round(res['tp'],2)}
@@ -137,7 +140,7 @@ TP: {round(res['tp'],2)}
     send(msg)
 
 # =========================
-# ANALYZE PORTFOLIO (NUOVO)
+# ANALYZE PORTFOLIO
 # =========================
 
 def analyze_portfolio():
@@ -153,9 +156,14 @@ def analyze_portfolio():
 
     for t in positions:
         price = get_price(t)
-        entry = positions[t]["entry"]
 
+        if price is None:
+            msg += f"{t}: ❌ dati non disponibili\n"
+            continue
+
+        entry = positions[t]["entry"]
         pnl = (price - entry) / entry * 100
+
         total += pnl
         count += 1
 
@@ -169,46 +177,60 @@ def analyze_portfolio():
         msg += f"{t}: {round(pnl,2)}% → {comment}\n"
 
     avg = total / count if count else 0
-
     msg += f"\n📊 Media portafoglio: {round(avg,2)}%"
 
     send(msg)
 
 # =========================
-# SPECULATIVO
-# =========================
-
-def scan_speculative():
-    alerts = []
-
-    for t in ASSETS:
-        try:
-            data = yf.download(t, period="2d", interval="1h", progress=False)
-            close = data["Close"].dropna()
-
-            change = (close.iloc[-1] - close.iloc[-5]) / close.iloc[-5] * 100
-
-            if abs(change) > 3:
-                alerts.append((t, round(change,2)))
-        except:
-            continue
-
-    if alerts:
-        msg = "⚡ MOVIMENTI FORTI:\n\n"
-        for t, c in alerts:
-            direction = "📈" if c > 0 else "📉"
-            msg += f"{t} {direction} {c}%\n"
-        send(msg)
-
-# =========================
-# TOP
+# TOP + LEGENDA
 # =========================
 
 def run_top():
-    msg = "🔥 TOP ASSET OGGI:\n\n"
-    for t in ASSETS[:3]:
-        price = get_price(t)
-        msg += f"{t}: {round(price,2)}\n"
+    candidates = []
+
+    for t in ASSETS:
+        res = analyze(t)
+        if res:
+            candidates.append(res)
+
+    if not candidates:
+        send("⚠️ Nessuna opportunità oggi")
+        return
+
+    candidates.sort(key=lambda x: x["rsi"])
+    top = candidates[:3]
+
+    msg = "🔥 MIGLIORI ORA:\n\n"
+
+    for t in top:
+        msg += f"""
+{t['ticker']}
+Prezzo: {round(t['price'],2)}
+SL: {round(t['sl'],2)}
+TP: {round(t['tp'],2)}
+
+👉 Consiglio: {t['advice']}
+
+Scrivi:
+BUY {t['ticker']}
+BUY {t['ticker']} prezzo
+
+---------
+"""
+
+    msg += """
+📘 COME USARE IL BOT:
+
+BUY TICKER → compra
+BUY TICKER prezzo → prezzo manuale
+
+ANALYZE TICKER → analisi
+ANALYZE PORTFOLIO → portafoglio
+
+STATUS → riepilogo
+TOP → opportunità ora
+"""
+
     send(msg)
 
 # =========================
@@ -220,8 +242,11 @@ def monitor():
 
     for t in list(positions.keys()):
         price = get_price(t)
-        entry = positions[t]["entry"]
 
+        if price is None:
+            continue
+
+        entry = positions[t]["entry"]
         pnl = (price - entry) / entry * 100
 
         if pnl >= 5 and not positions[t].get("tp1_hit"):
@@ -265,6 +290,10 @@ def handle_commands(offset):
             ticker = parts[1]
             price = get_price(ticker)
 
+            if price is None:
+                send("❌ Prezzo non disponibile")
+                continue
+
             entry = float(parts[2]) if len(parts) == 3 else price
 
             positions[ticker] = {
@@ -282,11 +311,10 @@ def handle_commands(offset):
 # =========================
 
 def main():
-    send("🚀 Bot aggiornato con ANALYZE attivo")
+    send("🚀 Bot attivo - versione intelligente")
 
     offset = None
     last_top = 0
-    last_spec = 0
 
     while True:
         try:
@@ -295,10 +323,6 @@ def main():
             if time.time() - last_top > 3600:
                 run_top()
                 last_top = time.time()
-
-            if time.time() - last_spec > 900:
-                scan_speculative()
-                last_spec = time.time()
 
             monitor()
 
