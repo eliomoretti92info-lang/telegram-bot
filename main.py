@@ -70,6 +70,31 @@ def get_price(ticker):
         return None
 
 # =========================
+# TIMING + FORZA
+# =========================
+
+def get_timing_and_strength(price, ma20, rsi, change):
+    
+    # 🟢 PERFETTO
+    if price > ma20 and 40 < rsi < 55 and change > 1:
+        return "momento perfetto 🟢", "ENTRA FORTE 💪"
+
+    # 🟡 BUONO
+    elif price > ma20 and rsi < 65:
+        return "buon momento 🟡", "ENTRA MEDIO ⚖️"
+
+    # ⚪ SPECULATIVO
+    elif rsi < 40 or change > 3:
+        return "speculativo ⚪", "ENTRA LEGGERO 🪶"
+
+    # 🔴 TARDI
+    elif rsi > 70 or change > 5:
+        return "è già tardi 🔴", "NON ENTRARE ❌"
+
+    else:
+        return "incerto", "ATTENDI"
+
+# =========================
 # ANALISI BASE
 # =========================
 
@@ -93,21 +118,13 @@ def analyze(ticker):
 
         trend = "rialzista" if price > ma50 else "debole"
 
-        if rsi < 40 and trend == "rialzista":
-            advice = "entra ora"
-        elif rsi > 65 or trend == "debole":
-            advice = "situazione rischiosa"
-        else:
-            advice = "meglio aspettare"
-
         return {
             "ticker": ticker,
             "price": price,
             "rsi": rsi,
             "trend": trend,
             "sl": price * 0.96,
-            "tp": price * 1.05,
-            "advice": advice
+            "tp": price * 1.05
         }
     except:
         return None
@@ -123,6 +140,10 @@ def analyze_ticker_command(ticker):
         send(f"❌ Impossibile analizzare {ticker}")
         return
 
+    timing, strength = get_timing_and_strength(
+        res['price'], res['price'], res['rsi'], 0
+    )
+
     msg = f"""
 📊 ANALISI {ticker}
 
@@ -131,7 +152,8 @@ Prezzo: {round(res['price'],2)}
 👉 Trend: {res['trend']}
 👉 RSI: {round(res['rsi'],1)}
 
-👉 Consiglio: {res['advice']}
+👉 Timing: {timing}
+👉 Azione: {strength}
 
 SL: {round(res['sl'],2)}
 TP: {round(res['tp'],2)}
@@ -150,38 +172,22 @@ def analyze_portfolio():
         return
 
     msg = "💼 ANALISI PORTAFOGLIO\n\n"
-    total = 0
-    count = 0
 
     for t in positions:
         price = get_price(t)
 
         if price is None:
-            msg += f"{t}: ❌ dati non disponibili\n"
             continue
 
         entry = positions[t]["entry"]
         pnl = (price - entry) / entry * 100
 
-        total += pnl
-        count += 1
-
-        if pnl > 2:
-            comment = "mantieni 👍"
-        elif pnl < -2:
-            comment = "attenzione ⚠️"
-        else:
-            comment = "neutrale"
-
-        msg += f"{t}: {round(pnl,2)}% → {comment}\n"
-
-    avg = total / count if count else 0
-    msg += f"\n📊 Media portafoglio: {round(avg,2)}%"
+        msg += f"{t}: {round(pnl,2)}%\n"
 
     send(msg)
 
 # =========================
-# TOP + GUIDA
+# TOP
 # =========================
 
 def run_top():
@@ -202,38 +208,24 @@ def run_top():
     msg = "🔥 MIGLIORI ORA:\n\n"
 
     for t in top:
+        timing, strength = get_timing_and_strength(
+            t['price'], t['price'], t['rsi'], 0
+        )
+
         msg += f"""
 {t['ticker']}
 Prezzo: {round(t['price'],2)}
-SL: {round(t['sl'],2)}
-TP: {round(t['tp'],2)}
 
-👉 Consiglio: {t['advice']}
-
-Scrivi:
-BUY {t['ticker']}
-BUY {t['ticker']} prezzo
+👉 {timing}
+👉 {strength}
 
 ---------
-"""
-
-    msg += """
-📘 COMANDI:
-
-BUY TICKER
-BUY TICKER prezzo
-
-ANALYZE TICKER
-ANALYZE PORTFOLIO
-
-STATUS
-TOP
 """
 
     send(msg)
 
 # =========================
-# SPECULATIVO FILTRATO
+# SPECULATIVO
 # =========================
 
 def scan_speculative():
@@ -251,25 +243,18 @@ def scan_speculative():
                 close = close.iloc[:, 0]
 
             close = close.dropna()
-
             if len(close) < 30:
                 continue
 
-            change_now = (close.iloc[-1] - close.iloc[-5]) / close.iloc[-5] * 100
-            change_prev = (close.iloc[-5] - close.iloc[-10]) / close.iloc[-10] * 100
-
+            change = (close.iloc[-1] - close.iloc[-5]) / close.iloc[-5] * 100
             ma20 = close.rolling(20).mean().iloc[-1]
             rsi = ta.momentum.RSIIndicator(close).rsi().iloc[-1]
             price = close.iloc[-1]
 
-            if change_now > 3 and change_prev > 1 and price > ma20 and rsi < 65:
-                alerts.append(f"{t} 📈 movimento confermato → entra ora 🔥")
+            timing, strength = get_timing_and_strength(price, ma20, rsi, change)
 
-            elif change_now < -3 and rsi < 35:
-                alerts.append(f"{t} ⚡ possibile rimbalzo → rischio alto")
-
-            elif change_now < -2 and price < ma20 and rsi > 50:
-                alerts.append(f"{t} 🚨 perdita forza → situazione rischiosa")
+            if abs(change) > 3:
+                alerts.append(f"{t} 📊 {round(change,2)}%\n👉 {timing}\n👉 {strength}")
 
         except:
             continue
@@ -277,7 +262,7 @@ def scan_speculative():
     if alerts:
         msg = "⚡ SPECULATIVO LIVE\n\n"
         for a in alerts[:5]:
-            msg += a + "\n"
+            msg += a + "\n\n"
         send(msg)
 
 # =========================
@@ -289,16 +274,14 @@ def monitor():
 
     for t in list(positions.keys()):
         price = get_price(t)
-
         if price is None:
             continue
 
         entry = positions[t]["entry"]
         pnl = (price - entry) / entry * 100
 
-        if pnl >= 5 and not positions[t].get("tp1_hit"):
-            send(f"💰 {t} +5% → valuta vendita")
-            positions[t]["tp1_hit"] = True
+        if pnl >= 5:
+            send(f"💰 {t} +5% → valuta uscita")
 
         if pnl <= -4:
             send(f"⚠️ {t} stop loss")
@@ -317,15 +300,12 @@ def handle_commands(offset):
     for u in data.get("result", []):
         offset = u["update_id"] + 1
         text = u.get("message", {}).get("text", "").upper().strip()
+        parts = text.split()
 
         print("📩", text)
-        parts = text.split()
 
         if text == "TOP":
             run_top()
-
-        elif text == "STATUS":
-            analyze_portfolio()
 
         elif text == "ANALYZE PORTFOLIO":
             analyze_portfolio()
@@ -336,18 +316,12 @@ def handle_commands(offset):
         elif parts[0] == "BUY":
             ticker = parts[1]
             price = get_price(ticker)
-
             if price is None:
-                send("❌ Prezzo non disponibile")
                 continue
 
             entry = float(parts[2]) if len(parts) == 3 else price
 
-            positions[ticker] = {
-                "entry": entry,
-                "tp1_hit": False
-            }
-
+            positions[ticker] = {"entry": entry}
             send(f"✅ {ticker} registrato a {round(entry,2)}")
 
     save_positions(positions)
@@ -358,7 +332,7 @@ def handle_commands(offset):
 # =========================
 
 def main():
-    send("🚀 Bot SPECULATIVO ATTIVO")
+    send("🚀 BOT TRADING AVANZATO ATTIVO")
 
     offset = None
     last_top = 0
