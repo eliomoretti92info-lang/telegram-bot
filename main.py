@@ -93,7 +93,6 @@ def analyze(ticker):
 
         trend = "rialzista" if price > ma50 else "debole"
 
-        # 👉 LOGICA CONSIGLIO
         if rsi < 40 and trend == "rialzista":
             advice = "entra ora"
         elif rsi > 65 or trend == "debole":
@@ -182,7 +181,7 @@ def analyze_portfolio():
     send(msg)
 
 # =========================
-# TOP + LEGENDA
+# TOP + GUIDA
 # =========================
 
 def run_top():
@@ -219,19 +218,67 @@ BUY {t['ticker']} prezzo
 """
 
     msg += """
-📘 COME USARE IL BOT:
+📘 COMANDI:
 
-BUY TICKER → compra
-BUY TICKER prezzo → prezzo manuale
+BUY TICKER
+BUY TICKER prezzo
 
-ANALYZE TICKER → analisi
-ANALYZE PORTFOLIO → portafoglio
+ANALYZE TICKER
+ANALYZE PORTFOLIO
 
-STATUS → riepilogo
-TOP → opportunità ora
+STATUS
+TOP
 """
 
     send(msg)
+
+# =========================
+# SPECULATIVO FILTRATO
+# =========================
+
+def scan_speculative():
+    alerts = []
+
+    for t in ASSETS:
+        try:
+            data = yf.download(t, period="2d", interval="15m", progress=False)
+
+            if data is None or data.empty:
+                continue
+
+            close = data["Close"]
+            if isinstance(close, pd.DataFrame):
+                close = close.iloc[:, 0]
+
+            close = close.dropna()
+
+            if len(close) < 30:
+                continue
+
+            change_now = (close.iloc[-1] - close.iloc[-5]) / close.iloc[-5] * 100
+            change_prev = (close.iloc[-5] - close.iloc[-10]) / close.iloc[-10] * 100
+
+            ma20 = close.rolling(20).mean().iloc[-1]
+            rsi = ta.momentum.RSIIndicator(close).rsi().iloc[-1]
+            price = close.iloc[-1]
+
+            if change_now > 3 and change_prev > 1 and price > ma20 and rsi < 65:
+                alerts.append(f"{t} 📈 movimento confermato → entra ora 🔥")
+
+            elif change_now < -3 and rsi < 35:
+                alerts.append(f"{t} ⚡ possibile rimbalzo → rischio alto")
+
+            elif change_now < -2 and price < ma20 and rsi > 50:
+                alerts.append(f"{t} 🚨 perdita forza → situazione rischiosa")
+
+        except:
+            continue
+
+    if alerts:
+        msg = "⚡ SPECULATIVO LIVE\n\n"
+        for a in alerts[:5]:
+            msg += a + "\n"
+        send(msg)
 
 # =========================
 # MONITOR
@@ -311,10 +358,11 @@ def handle_commands(offset):
 # =========================
 
 def main():
-    send("🚀 Bot attivo - versione intelligente")
+    send("🚀 Bot SPECULATIVO ATTIVO")
 
     offset = None
     last_top = 0
+    last_spec = 0
 
     while True:
         try:
@@ -323,6 +371,10 @@ def main():
             if time.time() - last_top > 3600:
                 run_top()
                 last_top = time.time()
+
+            if time.time() - last_spec > 300:
+                scan_speculative()
+                last_spec = time.time()
 
             monitor()
 
