@@ -38,6 +38,36 @@ def get_updates(offset=None):
         return {}
 
 # =========================
+# MENU
+# =========================
+
+def show_menu():
+    msg = """
+📘 COMANDI DISPONIBILI
+
+🟢 OPERATIVI:
+BUY TICKER
+BUY TICKER prezzo
+
+SELL TICKER
+
+📊 ANALISI:
+ANALYZE TICKER
+ANALYZE PORTFOLIO
+
+📈 MERCATO:
+TOP → migliori opportunità
+(auto ogni ora)
+
+⚡ SPECULATIVO:
+(alert automatici)
+
+📋 ALTRO:
+MENU → mostra comandi
+"""
+    send(msg)
+
+# =========================
 # STORAGE
 # =========================
 
@@ -74,20 +104,16 @@ def get_price(ticker):
 # =========================
 
 def get_timing_and_strength(price, ma20, rsi, change):
-    
-    # 🟢 PERFETTO
+
     if price > ma20 and 40 < rsi < 55 and change > 1:
         return "momento perfetto 🟢", "ENTRA FORTE 💪"
 
-    # 🟡 BUONO
     elif price > ma20 and rsi < 65:
         return "buon momento 🟡", "ENTRA MEDIO ⚖️"
 
-    # ⚪ SPECULATIVO
     elif rsi < 40 or change > 3:
         return "speculativo ⚪", "ENTRA LEGGERO 🪶"
 
-    # 🔴 TARDI
     elif rsi > 70 or change > 5:
         return "è già tardi 🔴", "NON ENTRARE ❌"
 
@@ -95,7 +121,7 @@ def get_timing_and_strength(price, ma20, rsi, change):
         return "incerto", "ATTENDI"
 
 # =========================
-# ANALISI BASE
+# ANALISI
 # =========================
 
 def analyze(ticker):
@@ -129,10 +155,6 @@ def analyze(ticker):
     except:
         return None
 
-# =========================
-# ANALYZE TICKER
-# =========================
-
 def analyze_ticker_command(ticker):
     res = analyze(ticker)
 
@@ -161,7 +183,7 @@ TP: {round(res['tp'],2)}
     send(msg)
 
 # =========================
-# ANALYZE PORTFOLIO
+# PORTFOLIO
 # =========================
 
 def analyze_portfolio():
@@ -171,7 +193,7 @@ def analyze_portfolio():
         send("📭 Nessuna posizione aperta")
         return
 
-    msg = "💼 ANALISI PORTAFOGLIO\n\n"
+    msg = "💼 PORTAFOGLIO\n\n"
 
     for t in positions:
         price = get_price(t)
@@ -304,7 +326,10 @@ def handle_commands(offset):
 
         print("📩", text)
 
-        if text == "TOP":
+        if text == "MENU":
+            show_menu()
+
+        elif text == "TOP":
             run_top()
 
         elif text == "ANALYZE PORTFOLIO":
@@ -316,13 +341,27 @@ def handle_commands(offset):
         elif parts[0] == "BUY":
             ticker = parts[1]
             price = get_price(ticker)
+
             if price is None:
+                send("❌ Prezzo non disponibile")
                 continue
 
             entry = float(parts[2]) if len(parts) == 3 else price
 
             positions[ticker] = {"entry": entry}
             send(f"✅ {ticker} registrato a {round(entry,2)}")
+
+        elif parts[0] == "SELL":
+            ticker = parts[1]
+
+            if ticker in positions:
+                del positions[ticker]
+                send(f"❌ {ticker} chiuso e rimosso")
+            else:
+                send(f"⚠️ {ticker} non presente")
+
+        else:
+            show_menu()
 
     save_positions(positions)
     return offset
@@ -332,7 +371,7 @@ def handle_commands(offset):
 # =========================
 
 def main():
-    send("🚀 BOT TRADING AVANZATO ATTIVO")
+    send("🚀 BOT COMPLETO ATTIVO")
 
     offset = None
     last_top = 0
