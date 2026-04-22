@@ -23,10 +23,26 @@ ASSETS = [
 # TELEGRAM
 # =========================
 
-def send(msg):
+def send(msg, keyboard=False):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+
+    data = {
+        "chat_id": CHAT_ID,
+        "text": msg
+    }
+
+    if keyboard:
+        data["reply_markup"] = json.dumps({
+            "keyboard": [
+                ["📊 TOP", "📘 MENU"],
+                ["📈 ANALYZE", "💼 PORTFOLIO"],
+                ["💰 BUY", "❌ SELL"]
+            ],
+            "resize_keyboard": True
+        })
+
     try:
-        requests.post(url, data={"chat_id": CHAT_ID, "text": msg}, timeout=20)
+        requests.post(url, data=data, timeout=20)
     except Exception as e:
         print("Telegram error:", e)
 
@@ -48,7 +64,6 @@ def show_menu():
 🟢 OPERATIVI:
 BUY TICKER
 BUY TICKER prezzo
-
 SELL TICKER
 
 📊 ANALISI:
@@ -57,7 +72,6 @@ ANALYZE PORTFOLIO
 
 📈 MERCATO:
 TOP → migliori opportunità
-(auto ogni ora)
 
 ⚡ SPECULATIVO:
 (alert automatici)
@@ -65,7 +79,7 @@ TOP → migliori opportunità
 📋 ALTRO:
 MENU → mostra comandi
 """
-    send(msg)
+    send(msg, keyboard=True)
 
 # =========================
 # STORAGE
@@ -326,16 +340,17 @@ def handle_commands(offset):
 
         print("📩", text)
 
-        if text == "MENU":
+        # PULSANTI
+        if "MENU" in text:
             show_menu()
 
-        elif text == "TOP":
+        elif "TOP" in text:
             run_top()
 
-        elif text == "ANALYZE PORTFOLIO":
+        elif "PORTFOLIO" in text:
             analyze_portfolio()
 
-        elif len(parts) == 2 and parts[0] == "ANALYZE":
+        elif "ANALYZE" in text and len(parts) == 2:
             analyze_ticker_command(parts[1])
 
         elif parts[0] == "BUY":
@@ -361,6 +376,7 @@ def handle_commands(offset):
                 send(f"⚠️ {ticker} non presente")
 
         else:
+            send("❓ Comando non riconosciuto")
             show_menu()
 
     save_positions(positions)
@@ -371,7 +387,8 @@ def handle_commands(offset):
 # =========================
 
 def main():
-    send("🚀 BOT COMPLETO ATTIVO")
+    send("🚀 BOT AVANZATO ATTIVO")
+    show_menu()
 
     offset = None
     last_top = 0
