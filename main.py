@@ -19,9 +19,6 @@ ASSETS = [
     "SPY","QQQ"
 ]
 
-# =========================
-# STATO
-# =========================
 SPEC_MODE = False
 
 # =========================
@@ -41,6 +38,35 @@ def get_updates(offset=None):
         return requests.get(url, params={"offset": offset, "timeout": 10}).json()
     except:
         return {}
+
+# =========================
+# MENU
+# =========================
+
+def show_menu():
+    msg = """
+📘 COMANDI DISPONIBILI
+
+🟢 OPERATIVI:
+BUY TICKER
+BUY TICKER prezzo
+SELL TICKER
+
+📊 ANALISI:
+ANALYZE TICKER
+ANALYZE PORTFOLIO
+
+📈 MERCATO:
+TOP → migliori opportunità ogni 30 min
+
+⚡ SPECULATIVO:
+SPEC ON → attiva segnali veloci (5 min)
+SPEC OFF → disattiva
+
+📋 ALTRO:
+MENU → mostra comandi
+"""
+    send(msg)
 
 # =========================
 # STORAGE
@@ -75,6 +101,22 @@ def get_price(ticker):
         return None
 
 # =========================
+# LOGICA DECISIONE
+# =========================
+
+def decision(price, rsi):
+    if rsi < 45:
+        return "🟢 ENTRA", "FORTE 💪"
+    elif rsi < 60:
+        return "🟡 ENTRA", "MEDIO ⚖️"
+    elif rsi < 70:
+        return "⏳ ASPETTA", "ATTENDI"
+    elif rsi < 80:
+        return "⚠️ RISCHIOSO", "LEGGERO 🪶"
+    else:
+        return "🔴 TROPPO TARDI", "NON ENTRARE"
+
+# =========================
 # ANALISI
 # =========================
 
@@ -97,7 +139,7 @@ def analyze(ticker):
         return None
 
 # =========================
-# TOP 30 MIN
+# TOP MIGLIORATO
 # =========================
 
 def run_top():
@@ -109,21 +151,31 @@ def run_top():
             continue
 
         price, rsi = res
-        msg += f"{t} | {round(price,2)} | RSI {round(rsi,1)}\n"
+        azione, forza = decision(price, rsi)
+
+        msg += f"""
+{t}
+Prezzo: {round(price,2)}
+RSI: {round(rsi,1)}
+
+👉 {azione}
+👉 {forza}
+
+---------
+"""
 
     send(msg)
 
 # =========================
-# SPECULATIVO 5 MIN
+# SPECULATIVO
 # =========================
 
 def run_speculative():
-    msg = "⚡ SPECULATIVO LIVE (5 min)\n\n"
+    msg = "⚡ SPECULATIVO LIVE\n\n"
 
     for t in ASSETS:
         try:
             data = yf.download(t, period="1d", interval="15m", progress=False)
-
             if data is None or data.empty:
                 continue
 
@@ -146,7 +198,7 @@ def run_speculative():
     send(msg)
 
 # =========================
-# MONITOR POSIZIONI
+# MONITOR
 # =========================
 
 def monitor():
@@ -161,16 +213,12 @@ def monitor():
         pnl = (price - entry) / entry * 100
 
         if pnl <= -1 and not positions[t].get("alert_down"):
-            send(f"🔻 {t} -1% → Vuoi uscire?")
+            send(f"🔻 {t} -1% → attenzione")
             positions[t]["alert_down"] = True
 
         if pnl >= 2 and not positions[t].get("alert_up"):
-            send(f"🔺 {t} +2% → Vuoi prendere profitto?")
+            send(f"🔺 {t} +2% → profitto")
             positions[t]["alert_up"] = True
-
-        if pnl <= -4:
-            send(f"⚠️ {t} stop loss")
-            del positions[t]
 
     save_positions(positions)
 
@@ -191,13 +239,16 @@ def handle_commands(offset):
 
         print("📩", text)
 
-        if text == "SPEC ON":
+        if text == "MENU":
+            show_menu()
+
+        elif text == "SPEC ON":
             SPEC_MODE = True
-            send("⚡ Modalità SPECULATIVA ATTIVA (5 min)")
+            send("⚡ SPEC ATTIVO (5 min)")
 
         elif text == "SPEC OFF":
             SPEC_MODE = False
-            send("⛔ Modalità SPECULATIVA DISATTIVATA")
+            send("⛔ SPEC DISATTIVO")
 
         elif parts[0] == "BUY":
             ticker = parts[1]
@@ -234,7 +285,8 @@ def handle_commands(offset):
 # =========================
 
 def main():
-    send("🚀 BOT ATTIVO (30min + Spec OFF)")
+    send("🚀 BOT ATTIVO")
+    show_menu()
 
     offset = None
     last_top = 0
@@ -245,12 +297,10 @@ def main():
             offset = handle_commands(offset)
             monitor()
 
-            # 🔥 ogni 30 min
             if time.time() - last_top > 1800:
                 run_top()
                 last_top = time.time()
 
-            # ⚡ spec attiva ogni 5 min
             if SPEC_MODE and time.time() - last_spec > 300:
                 run_speculative()
                 last_spec = time.time()
