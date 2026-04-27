@@ -20,43 +20,20 @@ ASSETS = [
 ]
 
 # =========================
+# STATO
+# =========================
+SPEC_MODE = False
+
+# =========================
 # TELEGRAM
 # =========================
 
-def send(msg, keyboard=None):
+def send(msg):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-
-    data = {
-        "chat_id": CHAT_ID,
-        "text": msg
-    }
-
-    if keyboard:
-        data["reply_markup"] = json.dumps(keyboard)
-
     try:
-        requests.post(url, data=data, timeout=20)
-    except Exception as e:
-        print("Telegram error:", e)
-
-def keyboard_menu():
-    return {
-        "keyboard": [
-            ["📊 TOP", "📘 MENU"],
-            ["📈 ANALYZE", "💼 PORTFOLIO"],
-            ["💰 BUY", "❌ SELL"]
-        ],
-        "resize_keyboard": True
-    }
-
-def keyboard_trade(ticker):
-    return {
-        "keyboard": [
-            [f"❌ SELL {ticker}", f"🟢 HOLD {ticker}"]
-        ],
-        "resize_keyboard": True,
-        "one_time_keyboard": True
-    }
+        requests.post(url, data={"chat_id": CHAT_ID, "text": msg}, timeout=20)
+    except:
+        pass
 
 def get_updates(offset=None):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
@@ -64,26 +41,6 @@ def get_updates(offset=None):
         return requests.get(url, params={"offset": offset, "timeout": 10}).json()
     except:
         return {}
-
-# =========================
-# MENU
-# =========================
-
-def show_menu():
-    msg = """
-📘 COMANDI DISPONIBILI
-
-BUY TICKER
-SELL TICKER
-
-ANALYZE TICKER
-ANALYZE PORTFOLIO
-
-TOP → opportunità
-
-Scrivi oppure usa i pulsanti 👇
-"""
-    send(msg, keyboard_menu())
 
 # =========================
 # STORAGE
@@ -118,49 +75,7 @@ def get_price(ticker):
         return None
 
 # =========================
-# MONITOR (INTERATTIVO)
-# =========================
-
-def monitor():
-    positions = load_positions()
-
-    for t in list(positions.keys()):
-        price = get_price(t)
-        if price is None:
-            continue
-
-        entry = positions[t]["entry"]
-        pnl = (price - entry) / entry * 100
-
-        # 🔻 -1%
-        if pnl <= -1 and not positions[t].get("alert_down"):
-            send(
-                f"🔻 {t} -1%\nVuoi uscire?",
-                keyboard_trade(t)
-            )
-            positions[t]["alert_down"] = True
-
-        # 🔺 +2%
-        if pnl >= 2 and not positions[t].get("alert_up"):
-            send(
-                f"🔺 {t} +2%\nVuoi prendere profitto?",
-                keyboard_trade(t)
-            )
-            positions[t]["alert_up"] = True
-
-        # 💰 +5%
-        if pnl >= 5:
-            send(f"💰 {t} +5% → valuta uscita")
-
-        # ⚠️ STOP LOSS
-        if pnl <= -4:
-            send(f"⚠️ {t} stop loss automatico")
-            del positions[t]
-
-    save_positions(positions)
-
-# =========================
-# ANALYZE BASE
+# ANALISI
 # =========================
 
 def analyze(ticker):
@@ -182,28 +97,90 @@ def analyze(ticker):
         return None
 
 # =========================
-# TOP
+# TOP 30 MIN
 # =========================
 
 def run_top():
-    msg = "🔥 MIGLIORI ORA\n\n"
+    msg = "🔥 MIGLIORI ORA (30 min)\n\n"
 
-    for t in ASSETS[:3]:
+    for t in ASSETS[:5]:
         res = analyze(t)
         if not res:
             continue
 
         price, rsi = res
-
-        msg += f"{t}\nPrezzo: {round(price,2)}\nRSI: {round(rsi,1)}\n\n"
+        msg += f"{t} | {round(price,2)} | RSI {round(rsi,1)}\n"
 
     send(msg)
 
 # =========================
-# COMMANDS
+# SPECULATIVO 5 MIN
+# =========================
+
+def run_speculative():
+    msg = "⚡ SPECULATIVO LIVE (5 min)\n\n"
+
+    for t in ASSETS:
+        try:
+            data = yf.download(t, period="1d", interval="15m", progress=False)
+
+            if data is None or data.empty:
+                continue
+
+            close = data["Close"]
+            if isinstance(close, pd.DataFrame):
+                close = close.iloc[:, 0]
+
+            close = close.dropna()
+            if len(close) < 10:
+                continue
+
+            change = (close.iloc[-1] - close.iloc[-3]) / close.iloc[-3] * 100
+
+            if abs(change) > 2:
+                msg += f"{t} → {round(change,2)}%\n"
+
+        except:
+            continue
+
+    send(msg)
+
+# =========================
+# MONITOR POSIZIONI
+# =========================
+
+def monitor():
+    positions = load_positions()
+
+    for t in list(positions.keys()):
+        price = get_price(t)
+        if price is None:
+            continue
+
+        entry = positions[t]["entry"]
+        pnl = (price - entry) / entry * 100
+
+        if pnl <= -1 and not positions[t].get("alert_down"):
+            send(f"🔻 {t} -1% → Vuoi uscire?")
+            positions[t]["alert_down"] = True
+
+        if pnl >= 2 and not positions[t].get("alert_up"):
+            send(f"🔺 {t} +2% → Vuoi prendere profitto?")
+            positions[t]["alert_up"] = True
+
+        if pnl <= -4:
+            send(f"⚠️ {t} stop loss")
+            del positions[t]
+
+    save_positions(positions)
+
+# =========================
+# COMANDI
 # =========================
 
 def handle_commands(offset):
+    global SPEC_MODE
+
     data = get_updates(offset)
     positions = load_positions()
 
@@ -214,14 +191,13 @@ def handle_commands(offset):
 
         print("📩", text)
 
-        if "MENU" in text:
-            show_menu()
+        if text == "SPEC ON":
+            SPEC_MODE = True
+            send("⚡ Modalità SPECULATIVA ATTIVA (5 min)")
 
-        elif "TOP" in text:
-            run_top()
-
-        elif "PORTFOLIO" in text:
-            send(str(positions))
+        elif text == "SPEC OFF":
+            SPEC_MODE = False
+            send("⛔ Modalità SPECULATIVA DISATTIVATA")
 
         elif parts[0] == "BUY":
             ticker = parts[1]
@@ -250,13 +226,6 @@ def handle_commands(offset):
             else:
                 send("⚠️ Non presente")
 
-        elif "HOLD" in text:
-            send("👍 Mantieni posizione")
-
-        else:
-            send("❓ Comando non riconosciuto")
-            show_menu()
-
     save_positions(positions)
     return offset
 
@@ -265,15 +234,27 @@ def handle_commands(offset):
 # =========================
 
 def main():
-    send("🚀 BOT INTERATTIVO ATTIVO")
-    show_menu()
+    send("🚀 BOT ATTIVO (30min + Spec OFF)")
 
     offset = None
+    last_top = 0
+    last_spec = 0
 
     while True:
         try:
             offset = handle_commands(offset)
             monitor()
+
+            # 🔥 ogni 30 min
+            if time.time() - last_top > 1800:
+                run_top()
+                last_top = time.time()
+
+            # ⚡ spec attiva ogni 5 min
+            if SPEC_MODE and time.time() - last_spec > 300:
+                run_speculative()
+                last_spec = time.time()
+
         except Exception as e:
             print("Errore:", e)
 
