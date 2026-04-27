@@ -10,7 +10,8 @@ import pandas as pd
 import ta
 
 
-# ============================================================
+#
+============================================================
 # CONFIG
 # ============================================================
 
@@ -56,13 +57,13 @@ def clamp(value, minimum=0, maximum=100):
 
 def pct_change(series, periods):
     if series is None or len(series) <= periods:
-        return 0
+        return 0.0
 
     old = series.iloc[-periods]
     new = series.iloc[-1]
 
     if old == 0:
-        return 0
+        return 0.0
 
     return float((new - old) / old * 100)
 
@@ -154,6 +155,9 @@ def send(msg, reply_markup=None):
 
 
 def answer_callback(callback_query_id):
+    if not callback_query_id:
+        return
+
     telegram_api("answerCallbackQuery", {
         "callback_query_id": callback_query_id
     })
@@ -171,7 +175,7 @@ def get_updates(offset=None):
             params={
                 "offset": offset,
                 "timeout": 10,
-                "allowed_updates": json.dumps(["message", "callback_query"])
+                "allowed_updates": json.dumps(["message", "callback_query", "edited_message"])
             },
             timeout=20
         )
@@ -184,7 +188,7 @@ def get_updates(offset=None):
 
 
 # ============================================================
-# MENU INLINE
+# MENU TELEGRAM
 # ============================================================
 
 def main_menu_keyboard():
@@ -236,7 +240,6 @@ def assets_keyboard(prefix="ANALYZE"):
 
 def position_keyboard():
     positions = load_positions()
-
     rows = []
 
     for ticker in positions.keys():
@@ -306,8 +309,8 @@ SPEC OFF
 MENU
 
 <b>Nota</b>
-Il bot non vede realmente gli ordini nascosti o le intenzioni degli operatori.
-Usa prezzo, volume, momentum, breakout e forza relativa come proxy.
+Il bot non vede davvero ordini nascosti o intenzioni degli operatori.
+Usa prezzo, volume, momentum, breakout, RSI e forza relativa come proxy.
 """
     send(msg, main_menu_keyboard())
 
@@ -336,6 +339,12 @@ SPEC automatico: ogni {SPEC_INTERVAL // 60} min
 # MARKET DATA
 # ============================================================
 
+def normalize_yfinance_columns(data):
+    if isinstance(data.columns, pd.MultiIndex):
+        data.columns = data.columns.get_level_values(0)
+    return data
+
+
 def download_ohlcv(ticker, period="6mo", interval="1d"):
     try:
         data = yf.download(
@@ -350,8 +359,7 @@ def download_ohlcv(ticker, period="6mo", interval="1d"):
         if data is None or data.empty:
             return None
 
-        if isinstance(data.columns, pd.MultiIndex):
-            data.columns = data.columns.get_level_values(0)
+        data = normalize_yfinance_columns(data)
 
         required = ["Open", "High", "Low", "Close", "Volume"]
 
@@ -395,7 +403,7 @@ def get_price(ticker):
 
 
 # ============================================================
-# ANALISI SMART
+# ANALISI SMART DAILY
 # ============================================================
 
 def analyze_smart(ticker, benchmark_close=None):
@@ -435,7 +443,7 @@ def analyze_smart(ticker, benchmark_close=None):
         avg_volume_20 = volume.rolling(20).mean().iloc[-1]
         current_volume = volume.iloc[-1]
 
-        volume_ratio = float(current_volume / avg_volume_20) if avg_volume_20 > 0 else 1
+        volume_ratio = float(current_volume / avg_volume_20) if avg_volume_20 > 0 else 1.0
 
         recent_high_20 = float(high.rolling(20).max().iloc[-2])
         recent_low_20 = float(low.rolling(20).min().iloc[-2])
@@ -447,43 +455,36 @@ def analyze_smart(ticker, benchmark_close=None):
 
         volatility = float(close.pct_change().rolling(20).std().iloc[-1] * 100)
 
-        relative_strength = 0
+        relative_strength = 0.0
 
         if benchmark_close is not None and len(benchmark_close) >= 20:
             asset_20d = pct_change(close, 20)
             bench_20d = pct_change(benchmark_close, 20)
             relative_strength = asset_20d - bench_20d
 
-        score = 0
+        score = 0.0
 
-        # Momentum breve
         if momentum_1d > 0:
             score += clamp(momentum_1d * 4, 0, 15)
 
-        # Momentum settimanale
         if momentum_5d > 0:
             score += clamp(momentum_5d * 2.5, 0, 20)
 
-        # Momentum mensile
         if momentum_20d > 0:
             score += clamp(momentum_20d * 1.2, 0, 20)
 
-        # Volume anomalo
         if volume_ratio > 1:
             score += clamp((volume_ratio - 1) * 15, 0, 20)
 
-        # Trend
         if trend_20:
             score += 7
 
         if trend_50:
             score += 7
 
-        # Breakout
         if breakout:
             score += 15
 
-        # RSI ideale
         if 50 <= rsi <= 68:
             score += 12
         elif 45 <= rsi < 50:
@@ -493,15 +494,12 @@ def analyze_smart(ticker, benchmark_close=None):
         elif rsi > 80:
             score -= 15
 
-        # Forza relativa
         if relative_strength > 0:
             score += clamp(relative_strength * 1.5, 0, 12)
 
-        # Penalità volatilità
         if volatility > 6:
             score -= 8
 
-        # Penalità se già molto esteso
         if distance_from_low > 35:
             score -= 6
 
@@ -632,12 +630,12 @@ def analyze_intraday_spec(ticker):
 
         change_15m = pct_change(close, 1)
         change_45m = pct_change(close, 3)
-        change_2h = pct_change(close, 😎
+        change_2h = pct_change(close, 8)
 
         avg_volume_30 = volume.rolling(30).mean().iloc[-1]
         current_volume = volume.iloc[-1]
 
-        volume_ratio = float(current_volume / avg_volume_30) if avg_volume_30 > 0 else 1
+        volume_ratio = float(current_volume / avg_volume_30) if avg_volume_30 > 0 else 1.0
 
         high_20 = float(high.rolling(20).max().iloc[-2])
         breakout = price > high_20
@@ -649,7 +647,7 @@ def analyze_intraday_spec(ticker):
 
         rsi = float(rsi_series.iloc[-1])
 
-        score = 0
+        score = 0.0
 
         if change_15m > 0:
             score += clamp(change_15m * 10, 0, 20)
@@ -915,11 +913,17 @@ Prezzo non disponibile
 # ============================================================
 
 def handle_callback(callback):
+    if not isinstance(callback, dict):
+        return
+
     callback_id = callback.get("id")
     data = callback.get("data", "")
 
     if callback_id:
         answer_callback(callback_id)
+
+    if not data:
+        return
 
     logging.info("Callback ricevuta: %s", data)
 
@@ -973,6 +977,9 @@ def handle_callback(callback):
 # ============================================================
 
 def handle_text_command(text):
+    if not isinstance(text, str):
+        return
+
     text = text.strip()
 
     if not text:
@@ -980,6 +987,10 @@ def handle_text_command(text):
 
     upper = text.upper()
     parts = upper.split()
+
+    if not parts:
+        return
+
     cmd = parts[0]
 
     logging.info("Comando ricevuto: %s", upper)
@@ -1028,7 +1039,6 @@ def handle_text_command(text):
             return
 
         ticker = parts[1]
-
         entry = None
 
         if len(parts) >= 3:
@@ -1055,18 +1065,40 @@ def handle_text_command(text):
 def handle_updates(offset):
     data = get_updates(offset)
 
-    for update in data.get("result", []):
-        offset = update["update_id"] + 1
+    if not isinstance(data, dict):
+        logging.error("Risposta Telegram non valida: %s", data)
+        return offset
 
-        if "callback_query" in update:
-            handle_callback(update["callback_query"])
-            continue
+    updates = data.get("result", [])
 
-        message = update.get("message", {})
-        text = message.get("text", "")
+    if not isinstance(updates, list):
+        logging.error("Campo result Telegram non valido: %s", updates)
+        return offset
 
-        if text:
+    for update in updates:
+        try:
+            if "update_id" in update:
+                offset = update["update_id"] + 1
+
+            if "callback_query" in update:
+                handle_callback(update.get("callback_query", {}))
+                continue
+
+            message = update.get("message") or update.get("edited_message") or {}
+
+            if not isinstance(message, dict):
+                continue
+
+            text = message.get("text")
+
+            if not text:
+                continue
+
             handle_text_command(text)
+
+        except Exception as e:
+            logging.exception("Errore gestione singolo update Telegram: %s", e)
+            continue
 
     return offset
 
@@ -1091,8 +1123,17 @@ def main():
     while True:
         try:
             offset = handle_updates(offset)
+
+        except Exception as e:
+            logging.exception("Errore handle_updates: %s", e)
+
+        try:
             monitor()
 
+        except Exception as e:
+            logging.exception("Errore monitor: %s", e)
+
+        try:
             now = time.time()
             config = load_config()
 
@@ -1105,7 +1146,7 @@ def main():
                 last_spec = now
 
         except Exception as e:
-            logging.exception("Errore nel main loop: %s", e)
+            logging.exception("Errore scanner automatici: %s", e)
 
         time.sleep(CHECK_INTERVAL)
 
