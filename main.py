@@ -1,6 +1,7 @@
 import os
 import time
 import json
+import html
 import logging
 from pathlib import Path
 
@@ -18,19 +19,26 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
 CHECK_INTERVAL = 30
-TOP_INTERVAL = 1800          # 30 minuti
-SPEC_INTERVAL = 300          # 5 minuti
+
+SCAN_INTERVAL = 300          # Scanner ogni 5 minuti
+SIGNAL_COOLDOWN = 1800       # Non ripete stesso segnale per 30 minuti
 
 POSITIONS_FILE = Path("positions.json")
-CONFIG_FILE = Path("config.json")
+STATE_FILE = Path("state.json")
 
-BENCHMARK = "SPY"
+MIN_SIGNAL_SCORE = 78        # Più alto = meno messaggi, più qualità
+MAX_SIGNALS_PER_SCAN = 3     # Meno messaggi
+
+PROFIT_STEP = 1.0
+LOSS_STEP = 1.0
+
+POSITION_SNOOZE_SECONDS = 900
 
 ASSETS = [
     "AAPL", "MSFT", "NVDA", "AMZN", "META",
     "TSLA", "GOOGL", "AMD", "PLTR",
-    "BTC-USD", "ETH-USD", "SOL-USD",
-    "SPY", "QQQ"
+    "SPY", "QQQ",
+    "BTC-USD", "ETH-USD", "SOL-USD"
 ]
 
 logging.basicConfig(
@@ -43,10 +51,22 @@ logging.basicConfig(
 # UTILS
 # ============================================================
 
+def now_ts():
+    return int(time.time())
+
+
+def e(value):
+    return html.escape(str(value))
+
+
+def clean_ticker(ticker):
+    return str(ticker).upper().strip()
+
+
 def safe_float(value):
     try:
         return float(value)
-    except (TypeError, ValueError):
+    except Exception:
         return None
 
 
@@ -74,8 +94,8 @@ def load_json(path, default):
     try:
         with path.open("r", encoding="utf-8") as f:
             return json.load(f)
-    except Exception as e:
-        logging.error("Errore lettura %s: %s", path, e)
+    except Exception as err:
+        logging.error("Errore lettura %s: %s", path, err)
         return default
 
 
@@ -87,8 +107,8 @@ def save_json(path, data):
             json.dump(data, f, indent=2)
 
         tmp.replace(path)
-    except Exception as e:
-        logging.error("Errore salvataggio %s: %s", path, e)
+    except Exception as err:
+        logging.error("Errore salvataggio %s: %s", path, err)
 
 
 def load_positions():
@@ -99,19 +119,26 @@ def save_positions(data):
     save_json(POSITIONS_FILE, data)
 
 
-def load_config():
-    return load_json(CONFIG_FILE, {
-        "spec_mode": False,
-        "top_auto": True
+def load_state():
+    return load_json(STATE_FILE, {
+        "auto_scan": True,
+        "last_signals": {}
     })
 
 
-def save_config(data):
-    save_json(CONFIG_FILE, data)
+def save_state(data):
+    save_json(STATE_FILE, data)
 
 
 def split_message(text, max_len=3900):
     return [text[i:i + max_len] for i in range(0, len(text), max_len)]
+
+
+def pnl_percent(price, entry):
+    if not entry or entry <= 0:
+        return 0.0
+
+    return float((price - entry) / entry * 100)
 
 
 # ============================================================
@@ -129,8 +156,8 @@ def telegram_api(method, payload=None):
         response = requests.post(url, json=payload or {}, timeout=20)
         response.raise_for_status()
         return response.json()
-    except requests.RequestException as e:
-        logging.error("Errore Telegram %s: %s", method, e)
+    except requests.RequestException as err:
+        logging.error("Errore Telegram %s: %s", method, err)
         return None
 
 
@@ -153,13 +180,16 @@ def send(msg, reply_markup=None):
         telegram_api("sendMessage", payload)
 
 
-def answer_callback(callback_query_id):
-    if not callback_query_id:
+def answer_callback(callback_id, text=None):
+    if not callback_id:
         return
 
-    telegram_api("answerCallbackQuery", {
-        "callback_query_id": callback_query_id
-    })
+    payload = {"callback_query_id": callback_id}
+
+    if text:
+        payload["text"] = text
+
+    telegram_api("answerCallbackQuery", payload)
 
 
 def get_updates(offset=None):
@@ -174,40 +204,44 @@ def get_updates(offset=None):
             params={
                 "offset": offset,
                 "timeout": 10,
-                "allowed_updates": json.dumps(["message", "callback_query", "edited_message"])
+                "allowed_updates": json.dumps([
+                    "message",
+                    "callback_query",
+                    "edited_message"
+                ])
             },
             timeout=20
         )
         response.raise_for_status()
         return response.json()
 
-    except requests.RequestException as e:
-        logging.error("Errore getUpdates: %s", e)
+    except requests.RequestException as err:
+        logging.error("Errore getUpdates: %s", err)
         return {"result": []}
 
 
 # ============================================================
-# MENU TELEGRAM
+# KEYBOARDS
 # ============================================================
 
-def main_menu_keyboard():
+def main_keyboard():
     return {
         "inline_keyboard": [
             [
-                {"text": "👑 TOP Assoluto", "callback_data": "TOP_ABSOLUTE"},
-                {"text": "⚡ SPEC Top", "callback_data": "SPEC_TOP"}
+                {"text": "🎯 Miglior segnale ora", "callback_data": "BEST_NOW"},
+                {"text": "🔎 Scan completo", "callback_data": "SCAN_NOW"}
             ],
             [
-                {"text": "📊 Analizza Asset", "callback_data": "ANALYZE_MENU"},
+                {"text": "📊 Analizza asset", "callback_data": "ANALYZE_MENU"},
                 {"text": "💼 Portafoglio", "callback_data": "POSITIONS"}
             ],
             [
-                {"text": "🟢 SPEC ON", "callback_data": "SPEC_ON"},
-                {"text": "🔴 SPEC OFF", "callback_data": "SPEC_OFF"}
+                {"text": "🟢 Auto Scan ON", "callback_data": "SCAN_ON"},
+                {"text": "🔴 Auto Scan OFF", "callback_data": "SCAN_OFF"}
             ],
             [
                 {"text": "📘 Comandi", "callback_data": "HELP"},
-                {"text": "⚙️ Stato Bot", "callback_data": "STATUS"}
+                {"text": "⚙️ Stato", "callback_data": "STATUS"}
             ]
         ]
     }
@@ -244,7 +278,7 @@ def position_keyboard():
     for ticker in positions.keys():
         rows.append([
             {"text": f"📊 {ticker}", "callback_data": f"ANALYZE:{ticker}"},
-            {"text": f"❌ SELL {ticker}", "callback_data": f"SELL:{ticker}"}
+            {"text": f"🚪 Esci {ticker}", "callback_data": f"EXIT:{ticker}"}
         ])
 
     rows.append([
@@ -254,97 +288,117 @@ def position_keyboard():
     return {"inline_keyboard": rows}
 
 
+def position_alert_keyboard(ticker):
+    ticker = clean_ticker(ticker)
+
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "🚪 Esci", "callback_data": f"EXIT:{ticker}"},
+                {"text": "🛡 Resto dentro", "callback_data": f"STAY:{ticker}"}
+            ],
+            [
+                {"text": "📊 Analizza", "callback_data": f"ANALYZE:{ticker}"},
+                {"text": "💼 Portafoglio", "callback_data": "POSITIONS"}
+            ]
+        ]
+    }
+
+
+# ============================================================
+# MENU
+# ============================================================
+
 def show_menu():
     msg = """
-<b>📘 BOT TRADING MENU</b>
+<b>🤖 BOT TREND ANTICIPATORE</b>
 
-Scegli una funzione dai pulsanti sotto.
+Questo bot cerca segnali più precoci e manda pochi alert.
 
-<b>Comandi manuali disponibili:</b>
+<b>Obiettivo:</b>
+- direzione chiara: LONG o RIBASSO
+- evitare ingressi troppo tardi
+- segnalare solo setup forti
+- proteggere le posizioni aperte
 
-BUY TICKER
-BUY TICKER prezzo
-SELL TICKER
-
-ANALYZE TICKER
-TOP
-TOP ASSOLUTO
-SPEC TOP
-HOT
-POSITIONS
-
-SPEC ON
-SPEC OFF
-MENU
+Usa i pulsanti sotto.
 """
-    send(msg, main_menu_keyboard())
+    send(msg, main_keyboard())
 
 
 def show_help():
     msg = """
-<b>📘 COMANDI DISPONIBILI</b>
+<b>📘 COMANDI</b>
 
-<b>🟢 Operativi</b>
+<b>Scanner</b>
+BEST
+SCAN
+AUTO ON
+AUTO OFF
+
+<b>Analisi</b>
+ANALYZE NVDA
+ANALYZE BTC-USD
+
+<b>Portafoglio</b>
 BUY AAPL
 BUY AAPL 210.50
 SELL AAPL
-
-<b>📊 Analisi</b>
-ANALYZE NVDA
-ANALYZE BTC-USD
 POSITIONS
 
-<b>👑 Scanner</b>
-TOP
-TOP ASSOLUTO
-SPEC TOP
-HOT
+<b>Gestione posizione</b>
+STAY AAPL
+EXIT AAPL
 
-<b>⚡ Modalità automatica</b>
-SPEC ON
-SPEC OFF
-
-<b>📋 Menu</b>
+<b>Menu</b>
 MENU
 
-<b>Nota</b>
-Il bot non vede davvero ordini nascosti o intenzioni degli operatori.
-Usa prezzo, volume, momentum, breakout, RSI e forza relativa come proxy.
+<b>Nota importante</b>
+Il bot non può prevedere con certezza il mercato.
+Cerca setup anticipati usando trend multi-timeframe, EMA, MACD, volume, RSI, distanza dal prezzo medio e rischio di movimento già esteso.
 """
-    send(msg, main_menu_keyboard())
+    send(msg, main_keyboard())
 
 
 def show_status():
-    config = load_config()
+    state = load_state()
     positions = load_positions()
 
     msg = f"""
 <b>⚙️ STATO BOT</b>
 
-Spec mode: {'🟢 ON' if config.get('spec_mode') else '🔴 OFF'}
-Top auto: {'🟢 ON' if config.get('top_auto') else '🔴 OFF'}
-
+Auto scan: {'🟢 ON' if state.get('auto_scan') else '🔴 OFF'}
 Asset monitorati: {len(ASSETS)}
 Posizioni aperte: {len(positions)}
 
-Intervallo controllo: {CHECK_INTERVAL}s
-TOP automatico: ogni {TOP_INTERVAL // 60} min
-SPEC automatico: ogni {SPEC_INTERVAL // 60} min
+Scan ogni: {SCAN_INTERVAL // 60} min
+Score minimo segnale: {MIN_SIGNAL_SCORE}/100
+Max segnali per scan: {MAX_SIGNALS_PER_SCAN}
+
+Monitor posizione:
++1%, +2%, +3%...
+-1%, -2%, -3%...
 """
-    send(msg, main_menu_keyboard())
+    send(msg, main_keyboard())
 
 
 # ============================================================
 # MARKET DATA
 # ============================================================
 
-def normalize_yfinance_columns(data):
+def normalize_columns(data):
+    if data is None:
+        return None
+
     if isinstance(data.columns, pd.MultiIndex):
         data.columns = data.columns.get_level_values(0)
+
     return data
 
 
-def download_ohlcv(ticker, period="6mo", interval="1d"):
+def download_ohlcv(ticker, period="30d", interval="15m"):
+    ticker = clean_ticker(ticker)
+
     try:
         data = yf.download(
             ticker,
@@ -358,7 +412,7 @@ def download_ohlcv(ticker, period="6mo", interval="1d"):
         if data is None or data.empty:
             return None
 
-        data = normalize_yfinance_columns(data)
+        data = normalize_columns(data)
 
         required = ["Open", "High", "Low", "Close", "Volume"]
 
@@ -368,492 +422,613 @@ def download_ohlcv(ticker, period="6mo", interval="1d"):
 
         data = data.dropna()
 
-        if data.empty:
+        if len(data) < 60:
             return None
 
         return data
 
-    except Exception as e:
-        logging.error("Errore download OHLCV %s: %s", ticker, e)
+    except Exception as err:
+        logging.error("Errore download %s: %s", ticker, err)
         return None
-
-
-def download_close(ticker, period="5d", interval="1h"):
-    data = download_ohlcv(ticker, period=period, interval=interval)
-
-    if data is None or "Close" not in data:
-        return None
-
-    close = data["Close"].dropna()
-
-    if close.empty:
-        return None
-
-    return close
 
 
 def get_price(ticker):
-    close = download_close(ticker, period="5d", interval="1h")
-
-    if close is None:
-        return None
-
-    return float(close.iloc[-1])
-
-
-# ============================================================
-# ANALISI SMART DAILY
-# ============================================================
-
-def analyze_smart(ticker, benchmark_close=None):
-    data = download_ohlcv(ticker, period="6mo", interval="1d")
-
-    if data is None or len(data) < 60:
-        return None
-
-    try:
-        close = data["Close"]
-        high = data["High"]
-        low = data["Low"]
-        volume = data["Volume"]
-
-        price = float(close.iloc[-1])
-
-        rsi_series = ta.momentum.RSIIndicator(close, window=14).rsi().dropna()
-
-        if rsi_series.empty:
-            return None
-
-        rsi = float(rsi_series.iloc[-1])
-
-        sma20 = close.rolling(20).mean()
-        sma50 = close.rolling(50).mean()
-
-        sma20_now = float(sma20.iloc[-1])
-        sma50_now = float(sma50.iloc[-1])
-
-        trend_20 = price > sma20_now
-        trend_50 = price > sma50_now
-
-        momentum_1d = pct_change(close, 1)
-        momentum_5d = pct_change(close, 5)
-        momentum_20d = pct_change(close, 20)
-
-        avg_volume_20 = volume.rolling(20).mean().iloc[-1]
-        current_volume = volume.iloc[-1]
-
-        volume_ratio = float(current_volume / avg_volume_20) if avg_volume_20 > 0 else 1.0
-
-        recent_high_20 = float(high.rolling(20).max().iloc[-2])
-        recent_low_20 = float(low.rolling(20).min().iloc[-2])
-
-        breakout = price > recent_high_20
-
-        distance_from_high = (price - recent_high_20) / recent_high_20 * 100
-        distance_from_low = (price - recent_low_20) / recent_low_20 * 100
-
-        volatility = float(close.pct_change().rolling(20).std().iloc[-1] * 100)
-
-        relative_strength = 0.0
-
-        if benchmark_close is not None and len(benchmark_close) >= 20:
-            asset_20d = pct_change(close, 20)
-            bench_20d = pct_change(benchmark_close, 20)
-            relative_strength = asset_20d - bench_20d
-
-        score = 0.0
-
-        if momentum_1d > 0:
-            score += clamp(momentum_1d * 4, 0, 15)
-
-        if momentum_5d > 0:
-            score += clamp(momentum_5d * 2.5, 0, 20)
-
-        if momentum_20d > 0:
-            score += clamp(momentum_20d * 1.2, 0, 20)
-
-        if volume_ratio > 1:
-            score += clamp((volume_ratio - 1) * 15, 0, 20)
-
-        if trend_20:
-            score += 7
-
-        if trend_50:
-            score += 7
-
-        if breakout:
-            score += 15
-
-        if 50 <= rsi <= 68:
-            score += 12
-        elif 45 <= rsi < 50:
-            score += 6
-        elif 68 < rsi <= 75:
-            score += 4
-        elif rsi > 80:
-            score -= 15
-
-        if relative_strength > 0:
-            score += clamp(relative_strength * 1.5, 0, 12)
-
-        if volatility > 6:
-            score -= 8
-
-        if distance_from_low > 35:
-            score -= 6
-
-        score = clamp(score, 0, 100)
-
-        if score >= 80:
-            label = "🔥 TOP ASSOLUTO"
-            action = "SPECULATIVO FORTE"
-        elif score >= 65:
-            label = "🟢 MOLTO INTERESSANTE"
-            action = "POSSIBILE ENTRATA"
-        elif score >= 50:
-            label = "🟡 DA MONITORARE"
-            action = "ATTENDERE CONFERMA"
-        elif score >= 35:
-            label = "⚪ NEUTRO"
-            action = "NESSUN VANTAGGIO"
-        else:
-            label = "🔴 DEBOLE"
-            action = "EVITARE"
-
-        return {
-            "ticker": ticker,
-            "price": price,
-            "score": score,
-            "label": label,
-            "action": action,
-            "rsi": rsi,
-            "momentum_1d": momentum_1d,
-            "momentum_5d": momentum_5d,
-            "momentum_20d": momentum_20d,
-            "volume_ratio": volume_ratio,
-            "breakout": breakout,
-            "relative_strength": relative_strength,
-            "volatility": volatility,
-            "trend_20": trend_20,
-            "trend_50": trend_50,
-            "distance_from_high": distance_from_high,
-            "distance_from_low": distance_from_low,
-            "sma20": sma20_now,
-            "sma50": sma50_now
-        }
-
-    except Exception as e:
-        logging.error("Errore analyze_smart %s: %s", ticker, e)
-        return None
-
-
-def format_smart_result(res, rank=None):
-    breakout_text = "SÌ 🚀" if res["breakout"] else "NO"
-
-    if res["trend_20"] and res["trend_50"]:
-        trend_text = "FORTE 📈"
-    elif res["trend_20"] or res["trend_50"]:
-        trend_text = "PARZIALE"
-    else:
-        trend_text = "DEBOLE 📉"
-
-    title = f"#{rank} {res['ticker']}" if rank else res["ticker"]
-
-    return f"""
-<b>{title}</b>
-Prezzo: <b>{res["price"]:.2f}</b>
-Score: <b>{res["score"]:.1f}/100</b>
-Segnale: {res["label"]}
-Azione: <b>{res["action"]}</b>
-
-RSI: {res["rsi"]:.1f}
-Momentum 1D: {res["momentum_1d"]:.2f}%
-Momentum 5D: {res["momentum_5d"]:.2f}%
-Momentum 20D: {res["momentum_20d"]:.2f}%
-
-Volume anomalo: {res["volume_ratio"]:.2f}x
-Breakout: {breakout_text}
-Trend SMA20/SMA50: {trend_text}
-Forza vs {BENCHMARK}: {res["relative_strength"]:.2f}%
-Volatilità: {res["volatility"]:.2f}%
-"""
-
-
-def run_top_absolute():
-    benchmark_data = download_ohlcv(BENCHMARK, period="6mo", interval="1d")
-    benchmark_close = benchmark_data["Close"] if benchmark_data is not None else None
-
-    results = []
-
-    for ticker in ASSETS:
-        res = analyze_smart(ticker, benchmark_close)
-
-        if res:
-            results.append(res)
-
-    if not results:
-        send("❌ Nessun dato disponibile per il TOP ASSOLUTO", main_menu_keyboard())
-        return
-
-    results.sort(key=lambda x: x["score"], reverse=True)
-
-    msg = """
-<b>👑 TOP ASSOLUTO SPECULATIVO</b>
-Radar: momentum + volumi + breakout + RSI + trend + forza relativa
-
-"""
-
-    for i, res in enumerate(results[:7], start=1):
-        msg += format_smart_result(res, rank=i)
-        msg += "\n---------\n"
-
-    send(msg, main_menu_keyboard())
-
-
-# ============================================================
-# SPECULATIVO INTRADAY
-# ============================================================
-
-def analyze_intraday_spec(ticker):
     data = download_ohlcv(ticker, period="5d", interval="15m")
 
-    if data is None or len(data) < 50:
+    if data is None:
+        return None
+
+    return float(data["Close"].iloc[-1])
+
+
+# ============================================================
+# INDICATORS
+# ============================================================
+
+def add_indicators(data):
+    df = data.copy()
+
+    close = df["Close"]
+    high = df["High"]
+    low = df["Low"]
+    volume = df["Volume"]
+
+    df["ema9"] = ta.trend.EMAIndicator(close, window=9).ema_indicator()
+    df["ema21"] = ta.trend.EMAIndicator(close, window=21).ema_indicator()
+    df["ema50"] = ta.trend.EMAIndicator(close, window=50).ema_indicator()
+
+    macd = ta.trend.MACD(close)
+    df["macd"] = macd.macd()
+    df["macd_signal"] = macd.macd_signal()
+    df["macd_hist"] = macd.macd_diff()
+
+    df["rsi"] = ta.momentum.RSIIndicator(close, window=14).rsi()
+
+    atr = ta.volatility.AverageTrueRange(
+        high=high,
+        low=low,
+        close=close,
+        window=14
+    )
+    df["atr"] = atr.average_true_range()
+    df["atr_pct"] = df["atr"] / close * 100
+
+    df["vol_avg20"] = volume.rolling(20).mean()
+    df["volume_ratio"] = volume / df["vol_avg20"]
+
+    df["high20_prev"] = high.rolling(20).max().shift(1)
+    df["low20_prev"] = low.rolling(20).min().shift(1)
+
+    df["ema21_slope"] = df["ema21"].diff(3)
+    df["ema50_slope"] = df["ema50"].diff(5)
+
+    df = df.dropna()
+
+    return df
+
+
+# ============================================================
+# TREND ENGINE
+# ============================================================
+
+def score_long(df15, df60):
+    last = df15.iloc[-1]
+    prev = df15.iloc[-2]
+    htf = df60.iloc[-1]
+
+    price = float(last["Close"])
+    ema9 = float(last["ema9"])
+    ema21 = float(last["ema21"])
+    ema50 = float(last["ema50"])
+
+    rsi = float(last["rsi"])
+    volume_ratio = float(last["volume_ratio"])
+    macd_hist = float(last["macd_hist"])
+    macd_hist_prev = float(prev["macd_hist"])
+
+    momentum_15m = pct_change(df15["Close"], 1)
+    momentum_45m = pct_change(df15["Close"], 3)
+    momentum_2h = pct_change(df15["Close"], 8)
+
+    htf_price = float(htf["Close"])
+    htf_ema21 = float(htf["ema21"])
+    htf_ema50 = float(htf["ema50"])
+
+    atr_pct = float(last["atr_pct"])
+    distance_from_ema21 = (price - ema21) / ema21 * 100
+
+    score = 0
+    reasons = []
+    late_penalty = 0
+
+    if price > ema9 > ema21:
+        score += 18
+        reasons.append("prezzo sopra EMA9/EMA21")
+
+    if ema21 > ema50:
+        score += 12
+        reasons.append("trend breve sopra EMA50")
+
+    if htf_price > htf_ema21 > htf_ema50:
+        score += 18
+        reasons.append("trend 1H rialzista")
+
+    if macd_hist > 0 and macd_hist > macd_hist_prev:
+        score += 14
+        reasons.append("MACD in accelerazione")
+
+    if 48 <= rsi <= 66:
+        score += 12
+        reasons.append("RSI in zona ingresso")
+    elif 66 < rsi <= 72:
+        score += 4
+        reasons.append("RSI forte ma già alto")
+    elif rsi > 75:
+        late_penalty += 18
+        reasons.append("RSI troppo tirato")
+
+    if volume_ratio >= 1.2:
+        score += clamp((volume_ratio - 1) * 18, 0, 16)
+        reasons.append("volume sopra media")
+
+    if momentum_15m > 0 and momentum_45m > 0:
+        score += 10
+        reasons.append("momentum intraday positivo")
+
+    if momentum_2h > 0:
+        score += 6
+        reasons.append("spinta 2H positiva")
+
+    if price > float(last["high20_prev"]):
+        score += 8
+        reasons.append("rottura massimi recenti")
+
+    # Filtro anti-ritardo: evita quando ha già corso troppo
+    if distance_from_ema21 > max(2.5, atr_pct * 1.3):
+        late_penalty += 16
+        reasons.append("prezzo già lontano da EMA21")
+
+    if momentum_2h > 4:
+        late_penalty += 14
+        reasons.append("movimento 2H già esteso")
+
+    final_score = clamp(score - late_penalty, 0, 100)
+
+    return {
+        "direction": "LONG",
+        "score": final_score,
+        "price": price,
+        "rsi": rsi,
+        "volume_ratio": volume_ratio,
+        "momentum_15m": momentum_15m,
+        "momentum_45m": momentum_45m,
+        "momentum_2h": momentum_2h,
+        "distance_ema21": distance_from_ema21,
+        "atr_pct": atr_pct,
+        "reasons": reasons
+    }
+
+
+def score_short(df15, df60):
+    last = df15.iloc[-1]
+    prev = df15.iloc[-2]
+    htf = df60.iloc[-1]
+
+    price = float(last["Close"])
+    ema9 = float(last["ema9"])
+    ema21 = float(last["ema21"])
+    ema50 = float(last["ema50"])
+
+    rsi = float(last["rsi"])
+    volume_ratio = float(last["volume_ratio"])
+    macd_hist = float(last["macd_hist"])
+    macd_hist_prev = float(prev["macd_hist"])
+
+    momentum_15m = pct_change(df15["Close"], 1)
+    momentum_45m = pct_change(df15["Close"], 3)
+    momentum_2h = pct_change(df15["Close"], 8)
+
+    htf_price = float(htf["Close"])
+    htf_ema21 = float(htf["ema21"])
+    htf_ema50 = float(htf["ema50"])
+
+    atr_pct = float(last["atr_pct"])
+    distance_from_ema21 = (price - ema21) / ema21 * 100
+
+    score = 0
+    reasons = []
+    late_penalty = 0
+
+    if price < ema9 < ema21:
+        score += 18
+        reasons.append("prezzo sotto EMA9/EMA21")
+
+    if ema21 < ema50:
+        score += 12
+        reasons.append("trend breve sotto EMA50")
+
+    if htf_price < htf_ema21 < htf_ema50:
+        score += 18
+        reasons.append("trend 1H ribassista")
+
+    if macd_hist < 0 and macd_hist < macd_hist_prev:
+        score += 14
+        reasons.append("MACD ribassista in accelerazione")
+
+    if 34 <= rsi <= 52:
+        score += 12
+        reasons.append("RSI in zona short")
+    elif 28 <= rsi < 34:
+        score += 4
+        reasons.append("RSI debole ma già basso")
+    elif rsi < 25:
+        late_penalty += 18
+        reasons.append("RSI troppo scarico")
+
+    if volume_ratio >= 1.2:
+        score += clamp((volume_ratio - 1) * 18, 0, 16)
+        reasons.append("volume sopra media")
+
+    if momentum_15m < 0 and momentum_45m < 0:
+        score += 10
+        reasons.append("momentum intraday negativo")
+
+    if momentum_2h < 0:
+        score += 6
+        reasons.append("spinta 2H negativa")
+
+    if price < float(last["low20_prev"]):
+        score += 8
+        reasons.append("rottura minimi recenti")
+
+    # Filtro anti-ritardo
+    if abs(distance_from_ema21) > max(2.5, atr_pct * 1.3):
+        late_penalty += 16
+        reasons.append("prezzo già lontano da EMA21")
+
+    if momentum_2h < -4:
+        late_penalty += 14
+        reasons.append("movimento 2H già esteso")
+
+    final_score = clamp(score - late_penalty, 0, 100)
+
+    return {
+        "direction": "RIBASSO",
+        "score": final_score,
+        "price": price,
+        "rsi": rsi,
+        "volume_ratio": volume_ratio,
+        "momentum_15m": momentum_15m,
+        "momentum_45m": momentum_45m,
+        "momentum_2h": momentum_2h,
+        "distance_ema21": distance_from_ema21,
+        "atr_pct": atr_pct,
+        "reasons": reasons
+    }
+
+
+def analyze_trend_signal(ticker):
+    ticker = clean_ticker(ticker)
+
+    data15 = download_ohlcv(ticker, period="30d", interval="15m")
+    data60 = download_ohlcv(ticker, period="60d", interval="1h")
+
+    if data15 is None or data60 is None:
         return None
 
     try:
-        close = data["Close"]
-        volume = data["Volume"]
-        high = data["High"]
+        df15 = add_indicators(data15)
+        df60 = add_indicators(data60)
 
-        price = float(close.iloc[-1])
-
-        change_15m = pct_change(close, 1)
-        change_45m = pct_change(close, 3)
-        change_2h = pct_change(close, 8)
-
-        avg_volume_30 = volume.rolling(30).mean().iloc[-1]
-        current_volume = volume.iloc[-1]
-
-        volume_ratio = float(current_volume / avg_volume_30) if avg_volume_30 > 0 else 1.0
-
-        high_20 = float(high.rolling(20).max().iloc[-2])
-        breakout = price > high_20
-
-        rsi_series = ta.momentum.RSIIndicator(close, window=14).rsi().dropna()
-
-        if rsi_series.empty:
+        if len(df15) < 80 or len(df60) < 80:
             return None
 
-        rsi = float(rsi_series.iloc[-1])
+        long_result = score_long(df15, df60)
+        short_result = score_short(df15, df60)
 
-        score = 0.0
+        best = long_result if long_result["score"] >= short_result["score"] else short_result
+        best["ticker"] = ticker
 
-        if change_15m > 0:
-            score += clamp(change_15m * 10, 0, 20)
-
-        if change_45m > 0:
-            score += clamp(change_45m * 7, 0, 25)
-
-        if change_2h > 0:
-            score += clamp(change_2h * 4, 0, 25)
-
-        if volume_ratio > 1:
-            score += clamp((volume_ratio - 1) * 20, 0, 25)
-
-        if breakout:
-            score += 20
-
-        if 50 <= rsi <= 72:
-            score += 10
-        elif rsi > 80:
-            score -= 20
-
-        score = clamp(score, 0, 100)
-
-        if score >= 80:
-            label = "🚀 ESPLOSIVO"
-        elif score >= 65:
-            label = "🔥 MOLTO CALDO"
-        elif score >= 50:
-            label = "🟡 INTERESSANTE"
+        if best["score"] >= 88:
+            best["quality"] = "FORTISSIMO"
+        elif best["score"] >= 78:
+            best["quality"] = "FORTE"
+        elif best["score"] >= 68:
+            best["quality"] = "INTERESSANTE"
         else:
-            label = "⚪ NORMALE"
+            best["quality"] = "DEBOLE"
 
-        return {
-            "ticker": ticker,
-            "price": price,
-            "score": score,
-            "label": label,
-            "change_15m": change_15m,
-            "change_45m": change_45m,
-            "change_2h": change_2h,
-            "volume_ratio": volume_ratio,
-            "breakout": breakout,
-            "rsi": rsi
-        }
+        return best
 
-    except Exception as e:
-        logging.error("Errore analyze_intraday_spec %s: %s", ticker, e)
+    except Exception as err:
+        logging.error("Errore analisi segnale %s: %s", ticker, err)
         return None
 
 
-def run_speculative_top():
+def format_signal(signal, rank=None):
+    direction_icon = "🟢" if signal["direction"] == "LONG" else "🔴"
+    rank_text = f"#{rank} " if rank else ""
+
+    reasons = signal.get("reasons", [])
+    reasons_text = "\n".join([f"- {e(r)}" for r in reasons[:5]])
+
+    msg = f"""
+{direction_icon} <b>{rank_text}{e(signal["ticker"])} — {e(signal["direction"])}</b>
+
+Qualità: <b>{e(signal["quality"])}</b>
+Score: <b>{signal["score"]:.1f}/100</b>
+Prezzo: <b>{signal["price"]:.2f}</b>
+
+Momentum 15m: {signal["momentum_15m"]:.2f}%
+Momentum 45m: {signal["momentum_45m"]:.2f}%
+Momentum 2H: {signal["momentum_2h"]:.2f}%
+
+RSI: {signal["rsi"]:.1f}
+Volume: {signal["volume_ratio"]:.2f}x
+Distanza EMA21: {signal["distance_ema21"]:.2f}%
+ATR: {signal["atr_pct"]:.2f}%
+
+<b>Perché:</b>
+{reasons_text}
+"""
+    return msg
+
+
+def scan_market(send_only_best=False, manual=True):
     results = []
 
     for ticker in ASSETS:
-        res = analyze_intraday_spec(ticker)
+        signal = analyze_trend_signal(ticker)
 
-        if res:
-            results.append(res)
-
-    if not results:
-        send("⚡ SPEC TOP\n\nNessun dato disponibile.", main_menu_keyboard())
-        return
+        if signal:
+            results.append(signal)
 
     results.sort(key=lambda x: x["score"], reverse=True)
 
-    hot = [r for r in results if r["score"] >= 50]
+    valid = [x for x in results if x["score"] >= MIN_SIGNAL_SCORE]
 
-    if not hot:
-        send("⚡ SPEC TOP\n\nNessun setup speculativo forte adesso.", main_menu_keyboard())
+    if not valid:
+        if manual:
+            send("Nessun segnale abbastanza forte adesso. Meglio aspettare.", main_keyboard())
+        return []
+
+    if send_only_best:
+        selected = valid[:1]
+    else:
+        selected = valid[:MAX_SIGNALS_PER_SCAN]
+
+    msg = "<b>🎯 SEGNALI DIREZIONALI AD ALTA QUALITÀ</b>\n"
+    msg += "Pochi alert, solo setup forti.\n\n"
+
+    for i, signal in enumerate(selected, start=1):
+        msg += format_signal(signal, rank=i)
+        msg += "\n---------\n"
+
+    send(msg, main_keyboard())
+    return selected
+
+
+def auto_scan_market():
+    state = load_state()
+
+    if not state.get("auto_scan", True):
         return
 
-    msg = """
-<b>⚡ SPEC TOP LIVE</b>
-Scanner 15m: momentum + volume + breakout
+    results = []
 
-"""
+    for ticker in ASSETS:
+        signal = analyze_trend_signal(ticker)
 
-    for i, r in enumerate(hot[:7], start=1):
-        breakout = "SÌ 🚀" if r["breakout"] else "NO"
+        if not signal:
+            continue
 
-        msg += f"""
-<b>#{i} {r["ticker"]}</b>
-Prezzo: <b>{r["price"]:.2f}</b>
-Score: <b>{r["score"]:.1f}/100</b>
-Segnale: {r["label"]}
+        if signal["score"] < MIN_SIGNAL_SCORE:
+            continue
 
-15m: {r["change_15m"]:.2f}%
-45m: {r["change_45m"]:.2f}%
-2h: {r["change_2h"]:.2f}%
+        results.append(signal)
 
-Volume: {r["volume_ratio"]:.2f}x
-RSI: {r["rsi"]:.1f}
-Breakout: {breakout}
+    results.sort(key=lambda x: x["score"], reverse=True)
+    results = results[:MAX_SIGNALS_PER_SCAN]
 
----------
-"""
+    if not results:
+        return
 
-    send(msg, main_menu_keyboard())
+    current_time = now_ts()
+    last_signals = state.get("last_signals", {})
 
+    fresh = []
 
-# ============================================================
-# ANALISI MANUALE
-# ============================================================
+    for signal in results:
+        key = f'{signal["ticker"]}:{signal["direction"]}'
+        last_time = int(last_signals.get(key, 0))
+
+        if current_time - last_time >= SIGNAL_COOLDOWN:
+            fresh.append(signal)
+            last_signals[key] = current_time
+
+    if not fresh:
+        return
+
+    state["last_signals"] = last_signals
+    save_state(state)
+
+    msg = "<b>🚨 NUOVO SEGNALE FORTE</b>\n\n"
+
+    for i, signal in enumerate(fresh, start=1):
+        msg += format_signal(signal, rank=i)
+        msg += "\n---------\n"
+
+    send(msg, main_keyboard())
+
 
 def analyze_manual(ticker):
-    benchmark_data = download_ohlcv(BENCHMARK, period="6mo", interval="1d")
-    benchmark_close = benchmark_data["Close"] if benchmark_data is not None else None
+    signal = analyze_trend_signal(ticker)
 
-    res = analyze_smart(ticker, benchmark_close)
-
-    if not res:
-        send(f"❌ Analisi non disponibile per {ticker}", main_menu_keyboard())
+    if not signal:
+        send(f"Analisi non disponibile per {e(ticker)}.", main_keyboard())
         return
 
-    msg = "<b>📊 ANALISI MANUALE</b>\n"
-    msg += format_smart_result(res)
+    msg = "<b>📊 ANALISI DIREZIONALE</b>\n"
+    msg += format_signal(signal)
 
-    if res["score"] >= 80:
-        comment = "Setup molto forte, ma attenzione a non inseguire candele già troppo estese."
-    elif res["score"] >= 65:
-        comment = "Setup interessante. Meglio cercare conferma su breakout o pullback controllato."
-    elif res["score"] >= 50:
-        comment = "Asset da monitorare. Non c'è ancora vantaggio netto."
+    if signal["score"] >= MIN_SIGNAL_SCORE:
+        msg += "\n<b>Lettura:</b> segnale operativo valido, ma attendi sempre conferma del tuo piano."
+    elif signal["score"] >= 65:
+        msg += "\n<b>Lettura:</b> interessante, ma non ancora abbastanza forte."
     else:
-        comment = "Setup debole. Meglio aspettare condizioni migliori."
+        msg += "\n<b>Lettura:</b> debole. Meglio non forzare."
 
-    msg += f"\n<b>Lettura:</b> {comment}"
-
-    send(msg, main_menu_keyboard())
+    send(msg, main_keyboard())
 
 
 # ============================================================
-# PORTFOLIO
+# PORTFOLIO MONITOR
 # ============================================================
 
-def buy_position(ticker, entry=None):
-    positions = load_positions()
-
-    market_price = get_price(ticker)
-
-    if market_price is None:
-        send(f"❌ Prezzo non disponibile per {ticker}", main_menu_keyboard())
-        return
-
-    final_entry = entry if entry is not None else market_price
-
-    if final_entry <= 0:
-        send("❌ Prezzo non valido", main_menu_keyboard())
-        return
-
-    positions[ticker] = {
-        "entry": final_entry,
-        "alert_down": False,
-        "alert_up": False,
-        "created_at": int(time.time()),
-        "last_price": market_price,
-        "pnl": 0
+def init_position(ticker, entry, market_price):
+    return {
+        "ticker": ticker,
+        "entry": float(entry),
+        "created_at": now_ts(),
+        "last_price": float(market_price),
+        "pnl": pnl_percent(market_price, entry),
+        "last_profit_band": 0,
+        "last_loss_band": 0,
+        "snooze_until": 0
     }
 
+
+def buy_position(ticker, entry=None):
+    ticker = clean_ticker(ticker)
+
+    price = get_price(ticker)
+
+    if price is None:
+        send(f"Prezzo non disponibile per {e(ticker)}.", main_keyboard())
+        return
+
+    final_entry = entry if entry is not None else price
+
+    if final_entry <= 0:
+        send("Prezzo non valido.", main_keyboard())
+        return
+
+    positions = load_positions()
+    positions[ticker] = init_position(ticker, final_entry, price)
+    save_positions(positions)
+
+    msg = f"""
+✅ <b>{e(ticker)} acquistato/registrato</b>
+
+Entry: <b>{final_entry:.2f}</b>
+Prezzo attuale: <b>{price:.2f}</b>
+
+Da ora ti avviso ogni:
++1%, +2%, +3%...
+-1%, -2%, -3%...
+
+Se scende ti chiedo se vuoi uscire o restare.
+"""
+    send(msg, main_keyboard())
+
+
+def exit_position(ticker):
+    ticker = clean_ticker(ticker)
+    positions = load_positions()
+
+    if ticker not in positions:
+        send(f"{e(ticker)} non è nel portafoglio.", main_keyboard())
+        return
+
+    pos = positions[ticker]
+    entry = safe_float(pos.get("entry"))
+    price = get_price(ticker)
+
+    if price is not None and entry:
+        pnl = pnl_percent(price, entry)
+    else:
+        pnl = safe_float(pos.get("pnl")) or 0.0
+
+    del positions[ticker]
+    save_positions(positions)
+
+    msg = f"""
+🚪 <b>{e(ticker)} rimosso dal monitoraggio</b>
+
+Ultimo PnL stimato: <b>{pnl:.2f}%</b>
+
+Nota: il bot non vende realmente sul broker.
+"""
+    send(msg, main_keyboard())
+
+
+def stay_position(ticker):
+    ticker = clean_ticker(ticker)
+    positions = load_positions()
+
+    if ticker not in positions:
+        send(f"{e(ticker)} non è nel portafoglio.", main_keyboard())
+        return
+
+    positions[ticker]["snooze_until"] = now_ts() + POSITION_SNOOZE_SECONDS
     save_positions(positions)
 
     send(
-        f"✅ <b>{ticker}</b> registrato a <b>{final_entry:.2f}</b>",
-        main_menu_keyboard()
+        f"🛡 Ok, resto dentro su <b>{e(ticker)}</b>.\n"
+        f"Sospendo gli avvisi di rischio per {POSITION_SNOOZE_SECONDS // 60} minuti.",
+        main_keyboard()
     )
 
 
-def sell_position(ticker):
+def monitor_positions():
     positions = load_positions()
 
-    if ticker in positions:
-        del positions[ticker]
-        save_positions(positions)
-        send(f"❌ <b>{ticker}</b> rimosso dal portafoglio", main_menu_keyboard())
-    else:
-        send(f"⚠️ {ticker} non è presente nel portafoglio", main_menu_keyboard())
+    if not positions:
+        return
 
-
-def monitor():
-    positions = load_positions()
+    current_time = now_ts()
     changed = False
 
     for ticker, pos in list(positions.items()):
+        ticker = clean_ticker(ticker)
+
+        entry = safe_float(pos.get("entry"))
+
+        if entry is None or entry <= 0:
+            continue
+
         price = get_price(ticker)
 
         if price is None:
             continue
 
-        entry = pos.get("entry")
+        current_pnl = pnl_percent(price, entry)
 
-        if not entry:
-            continue
+        pos["last_price"] = price
+        pos["pnl"] = current_pnl
+        pos["last_checked_at"] = current_time
 
-        pnl = (price - entry) / entry * 100
+        profit_band = int(current_pnl // PROFIT_STEP) if current_pnl >= PROFIT_STEP else 0
+        loss_band = int(abs(current_pnl) // LOSS_STEP) if current_pnl <= -LOSS_STEP else 0
 
-        positions[ticker]["last_price"] = price
-        positions[ticker]["pnl"] = pnl
+        last_profit_band = int(pos.get("last_profit_band", 0))
+        last_loss_band = int(pos.get("last_loss_band", 0))
 
-        if pnl <= -1 and not pos.get("alert_down"):
-            send(f"🔻 <b>{ticker}</b> {pnl:.2f}% → attenzione")
-            positions[ticker]["alert_down"] = True
+        if profit_band > last_profit_band:
+            pos["last_profit_band"] = profit_band
             changed = True
 
-        if pnl >= 2 and not pos.get("alert_up"):
-            send(f"🔺 <b>{ticker}</b> {pnl:.2f}% → profitto")
-            positions[ticker]["alert_up"] = True
+            msg = f"""
+🟢 <b>{e(ticker)} sale</b>
+
+Entry: <b>{entry:.2f}</b>
+Prezzo: <b>{price:.2f}</b>
+PnL: <b>+{current_pnl:.2f}%</b>
+
+Hai superato la soglia +{profit_band}%.
+"""
+            send(msg, position_alert_keyboard(ticker))
+
+        if loss_band > last_loss_band:
+            pos["last_loss_band"] = loss_band
             changed = True
+
+            snooze_until = int(pos.get("snooze_until", 0))
+
+            if current_time >= snooze_until:
+                msg = f"""
+🔴 <b>{e(ticker)} scende</b>
+
+Entry: <b>{entry:.2f}</b>
+Prezzo: <b>{price:.2f}</b>
+PnL: <b>{current_pnl:.2f}%</b>
+
+Hai superato la soglia -{loss_band}%.
+Vuoi uscire o restare dentro?
+"""
+                send(msg, position_alert_keyboard(ticker))
+
+        positions[ticker] = pos
 
     if changed:
         save_positions(positions)
@@ -863,37 +1038,34 @@ def show_positions():
     positions = load_positions()
 
     if not positions:
-        send("📭 Nessuna posizione aperta", main_menu_keyboard())
+        send("Nessuna posizione aperta.", main_keyboard())
         return
 
-    msg = "<b>💼 POSIZIONI APERTE</b>\n\n"
-
-    total_count = 0
+    msg = "<b>💼 PORTAFOGLIO</b>\n\n"
 
     for ticker, pos in positions.items():
-        total_count += 1
+        ticker = clean_ticker(ticker)
+        entry = safe_float(pos.get("entry"))
+        price = get_price(ticker)
 
-        entry = pos.get("entry")
-        last_price = get_price(ticker)
+        if price is not None and entry:
+            current_pnl = pnl_percent(price, entry)
+            pos["last_price"] = price
+            pos["pnl"] = current_pnl
 
-        if last_price is not None and entry:
-            pnl = (last_price - entry) / entry * 100
-            pos["last_price"] = last_price
-            pos["pnl"] = pnl
-
-            emoji = "🟢" if pnl >= 0 else "🔴"
+            icon = "🟢" if current_pnl >= 0 else "🔴"
 
             msg += f"""
-<b>{ticker}</b>
+<b>{e(ticker)}</b>
 Entry: {entry:.2f}
-Prezzo: {last_price:.2f}
-PnL: {emoji} {pnl:.2f}%
+Prezzo: {price:.2f}
+PnL: {icon} {current_pnl:.2f}%
 
 ---------
 """
         else:
             msg += f"""
-<b>{ticker}</b>
+<b>{e(ticker)}</b>
 Entry: {entry}
 Prezzo non disponibile
 
@@ -901,14 +1073,11 @@ Prezzo non disponibile
 """
 
     save_positions(positions)
-
-    msg += f"\nTotale posizioni: {total_count}"
-
     send(msg, position_keyboard())
 
 
 # ============================================================
-# CALLBACK MENU
+# CALLBACKS
 # ============================================================
 
 def handle_callback(callback):
@@ -918,13 +1087,10 @@ def handle_callback(callback):
     callback_id = callback.get("id")
     data = callback.get("data", "")
 
-    if callback_id:
-        answer_callback(callback_id)
+    answer_callback(callback_id)
 
     if not data:
         return
-
-    logging.info("Callback ricevuta: %s", data)
 
     if data == "MENU":
         show_menu()
@@ -935,44 +1101,48 @@ def handle_callback(callback):
     elif data == "STATUS":
         show_status()
 
-    elif data == "TOP_ABSOLUTE":
-        run_top_absolute()
+    elif data == "BEST_NOW":
+        scan_market(send_only_best=True, manual=True)
 
-    elif data == "SPEC_TOP":
-        run_speculative_top()
+    elif data == "SCAN_NOW":
+        scan_market(send_only_best=False, manual=True)
 
     elif data == "ANALYZE_MENU":
-        send("📊 Scegli asset da analizzare:", assets_keyboard("ANALYZE"))
+        send("Scegli asset da analizzare:", assets_keyboard("ANALYZE"))
 
     elif data == "POSITIONS":
         show_positions()
 
-    elif data == "SPEC_ON":
-        config = load_config()
-        config["spec_mode"] = True
-        save_config(config)
-        send("⚡ SPEC MODE ATTIVO", main_menu_keyboard())
+    elif data == "SCAN_ON":
+        state = load_state()
+        state["auto_scan"] = True
+        save_state(state)
+        send("🟢 Auto scan attivo.", main_keyboard())
 
-    elif data == "SPEC_OFF":
-        config = load_config()
-        config["spec_mode"] = False
-        save_config(config)
-        send("⛔ SPEC MODE DISATTIVO", main_menu_keyboard())
+    elif data == "SCAN_OFF":
+        state = load_state()
+        state["auto_scan"] = False
+        save_state(state)
+        send("🔴 Auto scan disattivato.", main_keyboard())
 
     elif data.startswith("ANALYZE:"):
         ticker = data.split(":", 1)[1]
         analyze_manual(ticker)
 
-    elif data.startswith("SELL:"):
+    elif data.startswith("EXIT:"):
         ticker = data.split(":", 1)[1]
-        sell_position(ticker)
+        exit_position(ticker)
+
+    elif data.startswith("STAY:"):
+        ticker = data.split(":", 1)[1]
+        stay_position(ticker)
 
     else:
-        send("Comando pulsante non riconosciuto.", main_menu_keyboard())
+        send("Comando non riconosciuto.", main_keyboard())
 
 
 # ============================================================
-# COMANDI TESTUALI
+# TEXT COMMANDS
 # ============================================================
 
 def handle_text_command(text):
@@ -992,8 +1162,6 @@ def handle_text_command(text):
 
     cmd = parts[0]
 
-    logging.info("Comando ricevuto: %s", upper)
-
     if upper == "MENU":
         show_menu()
 
@@ -1003,38 +1171,37 @@ def handle_text_command(text):
     elif upper in ["STATUS", "STATO"]:
         show_status()
 
-    elif upper in ["TOP", "TOP ASSOLUTO", "BEST", "SCAN"]:
-        run_top_absolute()
+    elif upper == "BEST":
+        scan_market(send_only_best=True, manual=True)
 
-    elif upper in ["SPEC TOP", "HOT", "SCALP"]:
-        run_speculative_top()
+    elif upper == "SCAN":
+        scan_market(send_only_best=False, manual=True)
+
+    elif upper == "AUTO ON":
+        state = load_state()
+        state["auto_scan"] = True
+        save_state(state)
+        send("🟢 Auto scan attivo.", main_keyboard())
+
+    elif upper == "AUTO OFF":
+        state = load_state()
+        state["auto_scan"] = False
+        save_state(state)
+        send("🔴 Auto scan disattivato.", main_keyboard())
 
     elif upper == "POSITIONS":
         show_positions()
 
-    elif upper == "SPEC ON":
-        config = load_config()
-        config["spec_mode"] = True
-        save_config(config)
-        send("⚡ SPEC MODE ATTIVO", main_menu_keyboard())
-
-    elif upper == "SPEC OFF":
-        config = load_config()
-        config["spec_mode"] = False
-        save_config(config)
-        send("⛔ SPEC MODE DISATTIVO", main_menu_keyboard())
-
     elif cmd == "ANALYZE":
         if len(parts) < 2:
-            send("Formato corretto: ANALYZE TICKER", main_menu_keyboard())
+            send("Formato corretto: ANALYZE TICKER", main_keyboard())
             return
 
-        ticker = parts[1]
-        analyze_manual(ticker)
+        analyze_manual(parts[1])
 
     elif cmd == "BUY":
         if len(parts) < 2:
-            send("Formato corretto: BUY TICKER oppure BUY TICKER prezzo", main_menu_keyboard())
+            send("Formato corretto: BUY TICKER oppure BUY TICKER prezzo", main_keyboard())
             return
 
         ticker = parts[1]
@@ -1044,34 +1211,38 @@ def handle_text_command(text):
             entry = safe_float(parts[2])
 
             if entry is None:
-                send("❌ Prezzo non valido", main_menu_keyboard())
+                send("Prezzo non valido.", main_keyboard())
                 return
 
         buy_position(ticker, entry)
 
-    elif cmd == "SELL":
+    elif cmd in ["SELL", "EXIT", "ESCI"]:
         if len(parts) < 2:
-            send("Formato corretto: SELL TICKER", main_menu_keyboard())
+            send("Formato corretto: SELL TICKER", main_keyboard())
             return
 
-        ticker = parts[1]
-        sell_position(ticker)
+        exit_position(parts[1])
+
+    elif cmd in ["STAY", "RESTO"]:
+        if len(parts) < 2:
+            send("Formato corretto: STAY TICKER", main_keyboard())
+            return
+
+        stay_position(parts[1])
 
     else:
-        send("Comando non riconosciuto. Scrivi MENU.", main_menu_keyboard())
+        send("Comando non riconosciuto. Scrivi MENU.", main_keyboard())
 
 
 def handle_updates(offset):
     data = get_updates(offset)
 
     if not isinstance(data, dict):
-        logging.error("Risposta Telegram non valida: %s", data)
         return offset
 
     updates = data.get("result", [])
 
     if not isinstance(updates, list):
-        logging.error("Campo result Telegram non valido: %s", updates)
         return offset
 
     for update in updates:
@@ -1090,14 +1261,11 @@ def handle_updates(offset):
 
             text = message.get("text")
 
-            if not text:
-                continue
+            if text:
+                handle_text_command(text)
 
-            handle_text_command(text)
-
-        except Exception as e:
-            logging.exception("Errore gestione singolo update Telegram: %s", e)
-            continue
+        except Exception as err:
+            logging.exception("Errore update Telegram: %s", err)
 
     return offset
 
@@ -1108,44 +1276,36 @@ def handle_updates(offset):
 
 def main():
     if not TELEGRAM_TOKEN:
-        raise RuntimeError("Imposta TELEGRAM_TOKEN nelle variabili ambiente")
+        raise RuntimeError("Manca TELEGRAM_TOKEN")
 
     if not CHAT_ID:
-        raise RuntimeError("Imposta CHAT_ID nelle variabili ambiente")
+        raise RuntimeError("Manca CHAT_ID")
 
-    send("🚀 <b>BOT TRADING ATTIVO</b>", main_menu_keyboard())
+    send("🤖 <b>BOT TREND ANTICIPATORE ATTIVO</b>", main_keyboard())
 
     offset = None
-    last_top = 0
-    last_spec = 0
+    last_scan = 0
 
     while True:
         try:
             offset = handle_updates(offset)
-
-        except Exception as e:
-            logging.exception("Errore handle_updates: %s", e)
-
-        try:
-            monitor()
-
-        except Exception as e:
-            logging.exception("Errore monitor: %s", e)
+        except Exception as err:
+            logging.exception("Errore handle_updates: %s", err)
 
         try:
-            now = time.time()
-            config = load_config()
+            monitor_positions()
+        except Exception as err:
+            logging.exception("Errore monitor_positions: %s", err)
 
-            if config.get("top_auto", True) and now - last_top >= TOP_INTERVAL:
-                run_top_absolute()
-                last_top = now
+        try:
+            current_time = time.time()
 
-            if config.get("spec_mode", False) and now - last_spec >= SPEC_INTERVAL:
-                run_speculative_top()
-                last_spec = now
+            if current_time - last_scan >= SCAN_INTERVAL:
+                auto_scan_market()
+                last_scan = current_time
 
-        except Exception as e:
-            logging.exception("Errore scanner automatici: %s", e)
+        except Exception as err:
+            logging.exception("Errore auto_scan_market: %s", err)
 
         time.sleep(CHECK_INTERVAL)
 
